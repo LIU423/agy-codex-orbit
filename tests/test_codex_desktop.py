@@ -39,16 +39,42 @@ def _init_fake_codex_home(tmp_path: Path) -> Path:
         CREATE TABLE threads (
             id TEXT PRIMARY KEY,
             name TEXT,
-            project_id TEXT
+            project_id TEXT,
+            source TEXT
         );
         """
     )
-    conn.execute("INSERT INTO threads (id, name, project_id) VALUES (?, ?, ?)", ("sess-1", "", None))
-    conn.execute("INSERT INTO threads (id, name, project_id) VALUES (?, ?, ?)", ("sess-2", "", None))
+    conn.execute("INSERT INTO threads (id, name, project_id, source) VALUES (?, ?, ?, ?)", ("sess-1", "", None, "exec"))
+    conn.execute("INSERT INTO threads (id, name, project_id, source) VALUES (?, ?, ?, ?)", ("sess-2", "", None, "exec"))
     conn.commit()
     conn.close()
 
-    # Create synthetic .codex-global-state.json
+    # Create synthetic .codex-global-state.sqlite (current Codex Desktop store)
+    gs_db_path = codex_home / ".codex-global-state.sqlite"
+    gs_conn = sqlite3.connect(str(gs_db_path))
+    gs_conn.executescript(
+        """
+        CREATE TABLE settings (
+            scope TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (scope, key)
+        );
+        """
+    )
+    gs_conn.execute("INSERT INTO settings VALUES ('global', 'local-projects', '{}')")
+    gs_conn.execute("INSERT INTO settings VALUES ('global', 'project-order', '[]')")
+    gs_conn.execute("INSERT INTO settings VALUES ('global', 'thread-project-assignments', '{}')")
+    gs_conn.execute("INSERT INTO settings VALUES ('global', 'thread-project-membership-host-ids', '{}')")
+    gs_conn.execute("INSERT INTO settings VALUES ('global', 'projectless-thread-ids', '[\"sess-1\"]')")
+    gs_conn.execute(
+        "INSERT INTO settings VALUES ('global', 'app-server-project-id-by-legacy-project-id-by-host', ?)",
+        (json.dumps({f"local:{codex_home}": {}}),),
+    )
+    gs_conn.commit()
+    gs_conn.close()
+
+    # Create synthetic .codex-global-state.json (legacy fallback)
     gs = {
         "local-projects": {},
         "project-order": [],
@@ -87,8 +113,37 @@ def test_ensure_codex_project_creates_reuses_and_backs_up(tmp_path: Path) -> Non
 
     conn = sqlite3.connect(str(codex_home / "state_5.sqlite"))
     assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 1
-    assert conn.execute("SELECT project_id FROM threads WHERE id = 'sess-1'").fetchone()[0] == pid
+    assert conn.execute("SELECT position FROM projects WHERE id = ?", (pid,)).fetchone()[0] == 0
+    assert conn.execute("SELECT project_id, source FROM threads WHERE id = 'sess-1'").fetchone() == (pid, "vscode")
     conn.close()
+
+    # Verify .codex-global-state.sqlite synced & backed up cleanly
+    assert (codex_home / ".codex-global-state.sqlite.agy-orbit.bak").is_file()
+    gs_conn = sqlite3.connect(str(codex_home / ".codex-global-state.sqlite"))
+    lp = json.loads(gs_conn.execute("SELECT value FROM settings WHERE scope='global' AND key='local-projects'").fetchone()[0])
+    po = json.loads(gs_conn.execute("SELECT value FROM settings WHERE scope='global' AND key='project-order'").fetchone()[0])
+    ta = json.loads(gs_conn.execute("SELECT value FROM settings WHERE scope='global' AND key='thread-project-assignments'").fetchone()[0])
+    pl = json.loads(gs_conn.execute("SELECT value FROM settings WHERE scope='global' AND key='projectless-thread-ids'").fetchone()[0])
+    idmap = json.loads(gs_conn.execute("SELECT value FROM settings WHERE scope='global' AND key='app-server-project-id-by-legacy-project-id-by-host'").fetchone()[0])
+    gs_conn.close()
+    assert pid in lp
+    assert po[0] == pid
+    assert ta["sess-1"] == {"projectKind": "local", "projectId": pid}
+    assert "sess-1" not in pl
+    assert any(m.get(pid) == pid for m in idmap.values())
+
+    # Creating a second new project places it at position 0 (top of sidebar) and shifts older ones down
+    workspace2 = tmp_path / "second-project"
+    workspace2.mkdir()
+    res_new = ensure_codex_project_and_bind(workspace2, None, codex_home=codex_home, allow_create=True)
+    assert res_new["created"] is True
+    pid2 = res_new["project_id"]
+    conn = sqlite3.connect(str(codex_home / "state_5.sqlite"))
+    assert conn.execute("SELECT position FROM projects WHERE id = ?", (pid2,)).fetchone()[0] == 0
+    assert conn.execute("SELECT position FROM projects WHERE id = ?", (pid,)).fetchone()[0] == 1
+    conn.close()
+    gs_after = json.loads((codex_home / ".codex-global-state.json").read_text(encoding="utf-8"))
+    assert gs_after["project-order"][0] == pid2
 
     # Second call with same workspace (different case on Windows) -> reuses project, no duplicate
     res2 = ensure_codex_project_and_bind(str(workspace).upper(), "sess-2", codex_home=codex_home, allow_create=True)
@@ -97,7 +152,7 @@ def test_ensure_codex_project_creates_reuses_and_backs_up(tmp_path: Path) -> Non
     assert res2["project_id"] == pid
 
     conn = sqlite3.connect(str(codex_home / "state_5.sqlite"))
-    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 2
     assert conn.execute("SELECT project_id FROM threads WHERE id = 'sess-2'").fetchone()[0] == pid
     conn.close()
 

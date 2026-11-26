@@ -84,7 +84,7 @@ export function renderActivityHeatmap(params: {
     weekIndex: number;
   }> = [];
 
-  const monthMarkers: Array<{ weekIndex: number; label: string }> = [];
+  const rawMonthMarkers: Array<{ weekIndex: number; label: string }> = [];
   let lastMonth = -1;
 
   for (let i = 0; i < weeks * 7; i++) {
@@ -96,7 +96,7 @@ export function renderActivityHeatmap(params: {
     if (isRow0) {
       const m = cur.getMonth();
       if (m !== lastMonth) {
-        monthMarkers.push({ weekIndex, label: monthLabel(m, locale) });
+        rawMonthMarkers.push({ weekIndex, label: monthLabel(m, locale) });
         lastMonth = m;
       }
     }
@@ -105,6 +105,22 @@ export function renderActivityHeatmap(params: {
     const value = future ? 0 : dayMetricValue(entry, origin, metric);
     if (value > maxVal) maxVal = value;
     cells.push({ dateStr, future, entry, value, weekIndex });
+  }
+
+  // Prevent overlapping month labels: drop a 1–2 week partial stub at column 0
+  // (e.g. Nov 30 right before Dec 1) and enforce a minimum 3-column (42px) spacing.
+  const monthMarkers: Array<{ weekIndex: number; label: string }> = [];
+  const startIdx =
+    rawMonthMarkers.length >= 2 && rawMonthMarkers[1].weekIndex - rawMonthMarkers[0].weekIndex < 3
+      ? 1
+      : 0;
+  for (let idx = startIdx; idx < rawMonthMarkers.length; idx++) {
+    const marker = rawMonthMarkers[idx];
+    const prev = monthMarkers[monthMarkers.length - 1];
+    if (prev && marker.weekIndex - prev.weekIndex < 3) {
+      continue;
+    }
+    monthMarkers.push(marker);
   }
 
   const paletteCls = origin === "agy" ? "palette-agy" : "palette-blue";
@@ -138,11 +154,13 @@ export function renderActivityHeatmap(params: {
     })
     .join("");
 
-  // Build aligned month labels along the bottom matching column positions.
+  // Build exact pixel-aligned month labels matching the 14px column pitch (11px cell + 3px gap).
+  const COL_PITCH_PX = 14;
+  const gridWidthPx = weeks * COL_PITCH_PX - 3;
   const monthsHtml = monthMarkers
     .map((m) => {
-      const pct = (m.weekIndex / weeks) * 100;
-      return `<span class="hm-month" style="left:${pct.toFixed(2)}%">${escapeAttr(m.label)}</span>`;
+      const leftPx = m.weekIndex * COL_PITCH_PX;
+      return `<span class="hm-month" style="left:${leftPx}px">${escapeAttr(m.label)}</span>`;
     })
     .join("");
 
@@ -154,9 +172,9 @@ export function renderActivityHeatmap(params: {
   return `
     <div class="hm-wrap ${paletteCls}">
       <div class="hm-scroll">
-        <div class="hm-inner" style="--hm-weeks:${weeks}">
+        <div class="hm-inner" style="width:${gridWidthPx}px">
           <div class="hm-grid">${cellsHtml}</div>
-          <div class="hm-months">${monthsHtml}</div>
+          <div class="hm-months" style="width:${gridWidthPx}px">${monthsHtml}</div>
         </div>
       </div>
       <div class="hm-footer">

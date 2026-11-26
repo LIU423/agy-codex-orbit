@@ -68,19 +68,18 @@ def _format_reset_time(epoch_sec: int | float | None) -> tuple[str | None, str |
         return None, None
 
 
-def _call_app_server_rpc(
+def _call_app_server_batch(
     codex_bin: Path,
-    method: str,
-    params: dict[str, Any],
+    calls: list[tuple[str, dict[str, Any]]],
     *,
-    timeout: float = 8.0,
-) -> dict[str, Any]:
-    """Execute a single JSON-RPC request against a short-lived `codex app-server --stdio`."""
+    timeout: float = 10.0,
+) -> list[dict[str, Any]]:
+    """Execute one or more JSON-RPC requests on a single short-lived `codex app-server --stdio`."""
     proc = subprocess.Popen(
         [str(codex_bin), "app-server", "--stdio"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -105,7 +104,7 @@ def _call_app_server_rpc(
                 continue
             if isinstance(msg, dict) and msg.get("id") == target_id:
                 return msg
-        raise TimeoutError(f"Timed out waiting for codex app-server response to {method}")
+        raise TimeoutError(f"Timed out waiting for codex app-server response id={target_id}")
 
     deadline = time.monotonic() + timeout
     try:
@@ -115,7 +114,7 @@ def _call_app_server_rpc(
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "codex-orbit", "version": "0.4.0"},
+                    "clientInfo": {"name": "codex-orbit", "version": "0.6.1"},
                     "capabilities": {"experimentalApi": True},
                 },
             }
@@ -125,12 +124,17 @@ def _call_app_server_rpc(
             raise RuntimeError(f"app-server initialize failed: {init_resp['error']}")
 
         _send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
-        _send({"jsonrpc": "2.0", "id": 2, "method": method, "params": params})
-        resp = _recv_id(2, deadline)
-        if "error" in resp:
-            raise RuntimeError(f"app-server {method} failed: {resp['error']}")
-        result = resp.get("result")
-        return result if isinstance(result, dict) else {"value": result}
+        results: list[dict[str, Any]] = []
+        req_id = 2
+        for method, params in calls:
+            _send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+            resp = _recv_id(req_id, deadline)
+            if "error" in resp:
+                raise RuntimeError(f"app-server {method} failed: {resp['error']}")
+            result = resp.get("result")
+            results.append(result if isinstance(result, dict) else {"value": result})
+            req_id += 1
+        return results
     finally:
         try:
             proc.terminate()
@@ -140,6 +144,17 @@ def _call_app_server_rpc(
                 proc.kill()
             except Exception:
                 pass
+
+
+def _call_app_server_rpc(
+    codex_bin: Path,
+    method: str,
+    params: dict[str, Any],
+    *,
+    timeout: float = 8.0,
+) -> dict[str, Any]:
+    """Execute a single JSON-RPC request against a short-lived `codex app-server --stdio`."""
+    return _call_app_server_batch(codex_bin, [(method, params)], timeout=timeout)[0]
 
 
 def _format_window(win: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -381,17 +396,18 @@ def _ensure_sqlite_project(
         if matched_pid is None and allow_create:
             matched_pid = preferred_id or str(uuid.uuid4())
             now_ms = int(time.time() * 1000)
-            max_pos = cur.execute("SELECT COALESCE(MAX(position), -1) FROM projects").fetchone()[0]
             cur.execute("BEGIN IMMEDIATE")
+            # Match Codex Desktop ordering: newest project sits at position 0 (top of sidebar).
+            cur.execute("UPDATE projects SET position = position + 1")
             if "metadata" in proj_cols:
                 cur.execute(
                     "INSERT INTO projects (id, name, metadata, position, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
-                    (matched_pid, project_name, "{}", int(max_pos) + 1, now_ms, now_ms),
+                    (matched_pid, project_name, "{}", 0, now_ms, now_ms),
                 )
             else:
                 cur.execute(
                     "INSERT INTO projects (id, name, position, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?)",
-                    (matched_pid, project_name, int(max_pos) + 1, now_ms, now_ms),
+                    (matched_pid, project_name, 0, now_ms, now_ms),
                 )
             cur.execute(
                 "INSERT INTO project_roots (project_id, position, path) VALUES (?, ?, ?)",
@@ -406,12 +422,210 @@ def _ensure_sqlite_project(
                     "UPDATE threads SET project_id = ? WHERE id = ?",
                     (matched_pid, session_id),
                 )
+            # Codex Desktop's default interactive `thread/list` hides `source='exec'` threads.
+            # Promote this AGY-delegated thread to interactive `vscode` so it appears in Codex Desktop.
+            if {"id", "source"}.issubset(thread_cols):
+                cur.execute(
+                    "UPDATE threads SET source = 'vscode' WHERE id = ? AND source = 'exec'",
+                    (session_id,),
+                )
 
         conn.commit()
         conn.close()
         return matched_pid, created, None
     except sqlite3.Error as exc:
         return None, False, f"SQLite project sync degraded: {exc}"
+
+
+def _ensure_global_state_sqlite_project(
+    gs_db_path: Path,
+    codex_home: Path,
+    norm_path: str,
+    project_name: str,
+    session_id: str | None,
+    *,
+    allow_create: bool,
+    app_server_pid: str | None = None,
+) -> tuple[str | None, bool, str | None]:
+    """Sync project & thread assignment into Codex Desktop's `.codex-global-state.sqlite`."""
+    if not gs_db_path.is_file():
+        return None, False, None
+
+    norm_key = _path_key(norm_path)
+    try:
+        conn = sqlite3.connect(str(gs_db_path), timeout=3.0)
+        cur = conn.cursor()
+        cols = {r[1] for r in cur.execute('PRAGMA table_info("settings")')}
+        if not {"scope", "key", "value"}.issubset(cols):
+            conn.close()
+            return None, False, ".codex-global-state.sqlite settings schema mismatch; skipped."
+
+        def _get_json(key: str, default: Any) -> Any:
+            row = cur.execute(
+                "SELECT value FROM settings WHERE scope = 'global' AND key = ?",
+                (key,),
+            ).fetchone()
+            if not row or not isinstance(row[0], str):
+                return default
+            try:
+                return json.loads(row[0])
+            except json.JSONDecodeError:
+                return default
+
+        def _set_json(key: str, val: Any) -> None:
+            encoded = json.dumps(val, ensure_ascii=False, separators=(",", ":"))
+            cur.execute(
+                "INSERT INTO settings (scope, key, value) VALUES ('global', ?, ?) "
+                "ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value",
+                (key, encoded),
+            )
+
+        local_projects = _get_json("local-projects", {})
+        if not isinstance(local_projects, dict):
+            conn.close()
+            return None, False, "Unexpected local-projects schema in .codex-global-state.sqlite."
+
+        matched_legacy_pid: str | None = None
+        for pid, entry in local_projects.items():
+            if not isinstance(entry, dict):
+                continue
+            roots = entry.get("rootPaths")
+            if isinstance(roots, list) and any(isinstance(r, str) and _path_key(r) == norm_key for r in roots):
+                matched_legacy_pid = str(entry.get("id") or pid)
+                break
+
+        changed = False
+        created = False
+        if matched_legacy_pid is None and allow_create:
+            matched_legacy_pid = app_server_pid or str(uuid.uuid4())
+            now_ms = int(time.time() * 1000)
+            local_projects[matched_legacy_pid] = {
+                "id": matched_legacy_pid,
+                "name": project_name,
+                "rootPaths": [norm_path],
+                "createdAt": now_ms,
+                "updatedAt": now_ms,
+            }
+            changed = True
+            created = True
+
+        project_order = _get_json("project-order", [])
+        if matched_legacy_pid and isinstance(project_order, list) and matched_legacy_pid not in project_order:
+            project_order.insert(0, matched_legacy_pid)
+            changed = True
+
+        # Keep legacy-id -> app-server-id mapping aligned so Codex Desktop resolves the folder picker entry.
+        id_map_by_host = _get_json("app-server-project-id-by-legacy-project-id-by-host", {})
+        if matched_legacy_pid and app_server_pid and isinstance(id_map_by_host, dict):
+            host_key = next(
+                (k for k in id_map_by_host.keys() if isinstance(k, str) and k.lower().startswith("local:")),
+                f"local:{_norm_win_path(codex_home)}",
+            )
+            host_map = id_map_by_host.get(host_key)
+            if not isinstance(host_map, dict):
+                host_map = {}
+                id_map_by_host[host_key] = host_map
+            if host_map.get(matched_legacy_pid) != app_server_pid:
+                host_map[matched_legacy_pid] = app_server_pid
+                changed = True
+
+        assignments = _get_json("thread-project-assignments", {})
+        membership_hosts = _get_json("thread-project-membership-host-ids", {})
+        projectless = _get_json("projectless-thread-ids", [])
+        if matched_legacy_pid and session_id:
+            if isinstance(assignments, dict):
+                desired = {"projectKind": "local", "projectId": matched_legacy_pid}
+                if assignments.get(session_id) != desired:
+                    assignments[session_id] = desired
+                    changed = True
+            if isinstance(membership_hosts, dict) and membership_hosts.get(session_id) != "local":
+                membership_hosts[session_id] = "local"
+                changed = True
+            if isinstance(projectless, list) and session_id in projectless:
+                projectless.remove(session_id)
+                changed = True
+
+        if changed:
+            backup_path = gs_db_path.with_name(gs_db_path.name + ".agy-orbit.bak")
+            try:
+                bconn = sqlite3.connect(str(backup_path))
+                conn.backup(bconn)
+                bconn.close()
+            except sqlite3.Error:
+                pass
+
+            cur.execute("BEGIN IMMEDIATE")
+            _set_json("local-projects", local_projects)
+            if isinstance(project_order, list):
+                _set_json("project-order", project_order)
+            if isinstance(id_map_by_host, dict) and id_map_by_host:
+                _set_json("app-server-project-id-by-legacy-project-id-by-host", id_map_by_host)
+            if isinstance(assignments, dict):
+                _set_json("thread-project-assignments", assignments)
+            if isinstance(membership_hosts, dict) and membership_hosts:
+                _set_json("thread-project-membership-host-ids", membership_hosts)
+            if isinstance(projectless, list):
+                _set_json("projectless-thread-ids", projectless)
+            conn.commit()
+
+        conn.close()
+        return matched_legacy_pid, created, None
+    except sqlite3.Error as exc:
+        return None, False, f".codex-global-state.sqlite sync degraded: {exc}"
+
+
+def _ensure_thread_section_via_rpc(
+    codex_bin: Path,
+    section_name: str,
+    session_id: str | None,
+    *,
+    allow_create: bool,
+) -> tuple[str | None, bool, str | None]:
+    """Ensure a Codex Desktop sidebar section (`threadSection`) exists and move `session_id` into it."""
+    target_low = section_name.strip().lower()
+    if not target_low:
+        return None, False, None
+    try:
+        listed = _call_app_server_rpc(codex_bin, "threadSection/list", {}, timeout=8.0)
+        raw_sections = listed.get("data") or listed.get("sections") or []
+        matched_sid: str | None = None
+        if isinstance(raw_sections, list):
+            for entry in raw_sections:
+                if not isinstance(entry, dict):
+                    continue
+                nm = entry.get("name")
+                if isinstance(nm, str) and nm.strip().lower() == target_low:
+                    matched_sid = str(entry.get("id") or "")
+                    break
+
+        created = False
+        if not matched_sid and allow_create:
+            created_res = _call_app_server_rpc(
+                codex_bin,
+                "threadSection/create",
+                {"name": section_name},
+                timeout=8.0,
+            )
+            sec_obj = created_res.get("section") if isinstance(created_res.get("section"), dict) else created_res
+            sid_val = sec_obj.get("id") if isinstance(sec_obj, dict) else None
+            if isinstance(sid_val, str) and sid_val:
+                matched_sid = sid_val
+                created = True
+
+        if matched_sid and session_id:
+            try:
+                _call_app_server_rpc(
+                    codex_bin,
+                    "thread/section/move",
+                    {"threadId": session_id, "sectionId": matched_sid},
+                    timeout=8.0,
+                )
+            except (OSError, TimeoutError, RuntimeError):
+                pass
+
+        return matched_sid, created, None
+    except (OSError, TimeoutError, RuntimeError) as exc:
+        return None, False, f"threadSection RPC degraded: {exc}"
 
 
 def _ensure_global_state_project(
@@ -467,7 +681,7 @@ def _ensure_global_state_project(
         }
         order = data.get("project-order")
         if isinstance(order, list) and matched_pid not in order:
-            order.append(matched_pid)
+            order.insert(0, matched_pid)
         changed = True
         created = True
 
@@ -499,32 +713,123 @@ def _ensure_global_state_project(
     return matched_pid, created, None
 
 
+def _ensure_project_via_rpc(
+    codex_bin: Path,
+    norm_path: str,
+    project_name: str,
+    session_id: str | None,
+    *,
+    allow_create: bool,
+) -> tuple[str | None, bool, bool, str | None]:
+    """Use official `codex app-server` project RPCs (`project/list`, `project/create`, `thread/metadata/update`).
+
+    Returns `(project_id, created, bound, warning)`.
+    """
+    norm_key = _path_key(norm_path)
+    try:
+        listed = _call_app_server_rpc(codex_bin, "project/list", {}, timeout=8.0)
+        raw_projects = listed.get("data") or listed.get("projects") or []
+        matched_pid: str | None = None
+        if isinstance(raw_projects, list):
+            for entry in raw_projects:
+                if not isinstance(entry, dict):
+                    continue
+                roots = entry.get("roots") or []
+                if isinstance(roots, list):
+                    for rt in roots:
+                        rpath = rt.get("path") if isinstance(rt, dict) else rt
+                        if isinstance(rpath, str) and _path_key(rpath) == norm_key:
+                            matched_pid = str(entry.get("id") or "")
+                            break
+                if matched_pid:
+                    break
+
+        created = False
+        if not matched_pid and allow_create:
+            idem = f"agy-orbit:{norm_key}"
+            created_res = _call_app_server_rpc(
+                codex_bin,
+                "project/create",
+                {
+                    "idempotencyKey": idem,
+                    "name": project_name,
+                    "roots": [{"path": norm_path}],
+                },
+                timeout=8.0,
+            )
+            proj_obj = created_res.get("project") if isinstance(created_res.get("project"), dict) else created_res
+            pid_val = proj_obj.get("id") if isinstance(proj_obj, dict) else None
+            if isinstance(pid_val, str) and pid_val:
+                matched_pid = pid_val
+                created = True
+
+        bound = False
+        if matched_pid and session_id:
+            try:
+                _call_app_server_rpc(
+                    codex_bin,
+                    "thread/metadata/update",
+                    {"threadId": session_id, "projectId": matched_pid},
+                    timeout=8.0,
+                )
+                bound = True
+            except (OSError, TimeoutError, RuntimeError):
+                bound = False
+
+        return matched_pid, created, bound, None
+    except (OSError, TimeoutError, RuntimeError) as exc:
+        return None, False, False, f"app-server project RPC degraded: {exc}"
+
+
 def ensure_codex_project_and_bind(
     workspace_dir: Path | str,
     session_id: str | None = None,
     *,
+    codex_bin: Path | str | None = None,
     codex_home: Path | None = None,
     allow_create: bool = True,
+    use_rpc: bool | None = None,
 ) -> dict[str, Any]:
     """Ensure `workspace_dir` exists as a Codex Desktop project and bind `session_id` to it.
 
-    Backs up `.codex-global-state.json` before edits, validates schemas, and degrades gracefully
-    without breaking delegation if Codex Desktop internal files change shape.
+    Prefers official `codex app-server` RPCs (`project/list`, `project/create`, `thread/metadata/update`)
+    when operating against the default local Codex home, then keeps `.codex-global-state.json` and
+    `state_5.sqlite` synchronized with backup, schema validation, and graceful degradation.
     """
     home = codex_home or default_codex_home()
     norm_path = _norm_win_path(workspace_dir)
     project_name = Path(norm_path).name or norm_path
     warnings: list[str] = []
 
-    gs_pid, gs_created, gs_warn = _ensure_global_state_project(
-        home / ".codex-global-state.json",
-        norm_path,
-        project_name,
-        session_id,
-        allow_create=allow_create,
-    )
-    if gs_warn:
-        warnings.append(gs_warn)
+    # Only invoke live `codex app-server` RPCs when targeting the real Codex home (not isolated test tmpdirs).
+    should_use_rpc = (codex_home is None) if use_rpc is None else bool(use_rpc)
+    rpc_pid: str | None = None
+    rpc_created = False
+    rpc_bound = False
+    section_id: str | None = None
+    section_created = False
+    if should_use_rpc:
+        try:
+            binary = locate_codex_binary(codex_bin)
+            rpc_pid, rpc_created, rpc_bound, rpc_warn = _ensure_project_via_rpc(
+                binary,
+                norm_path,
+                project_name,
+                session_id,
+                allow_create=allow_create,
+            )
+            if rpc_warn:
+                warnings.append(rpc_warn)
+            section_id, section_created, sec_warn = _ensure_thread_section_via_rpc(
+                binary,
+                project_name,
+                session_id,
+                allow_create=allow_create,
+            )
+            if sec_warn:
+                warnings.append(sec_warn)
+        except CodexBinaryNotFoundError:
+            pass
 
     sq_pid, sq_created, sq_warn = _ensure_sqlite_project(
         home / "state_5.sqlite",
@@ -532,25 +837,53 @@ def ensure_codex_project_and_bind(
         project_name,
         session_id,
         allow_create=allow_create,
-        preferred_id=gs_pid,
+        preferred_id=rpc_pid,
     )
     if sq_warn:
         warnings.append(sq_warn)
 
-    project_id = gs_pid or sq_pid
-    created = gs_created or sq_created
+    canonical_pid = rpc_pid or sq_pid
+
+    gs_db_pid, gs_db_created, gs_db_warn = _ensure_global_state_sqlite_project(
+        home / ".codex-global-state.sqlite",
+        home,
+        norm_path,
+        project_name,
+        session_id,
+        allow_create=allow_create,
+        app_server_pid=canonical_pid,
+    )
+    if gs_db_warn:
+        warnings.append(gs_db_warn)
+
+    gs_pid, gs_created, gs_warn = _ensure_global_state_project(
+        home / ".codex-global-state.json",
+        norm_path,
+        project_name,
+        session_id,
+        allow_create=allow_create,
+        preferred_id=gs_db_pid or canonical_pid,
+    )
+    if gs_warn:
+        warnings.append(gs_warn)
+
+    project_id = canonical_pid or gs_db_pid or gs_pid
+    created = rpc_created or sq_created or gs_db_created or gs_created
     desktop_running = _is_codex_desktop_running()
 
     result: dict[str, Any] = {
         "workspace_dir": norm_path,
         "project_name": project_name,
         "project_id": project_id,
+        "section_id": section_id,
+        "section_created": section_created,
         "created": created,
-        "bound": bool(project_id and session_id),
+        "bound": bool((rpc_bound or project_id) and session_id),
+        "via_rpc": bool(rpc_pid),
         "codex_desktop_running": desktop_running,
     }
     if warnings:
         result["warnings"] = warnings
     if created and desktop_running:
-        result["note"] = "Codex Desktop is currently open; reload Codex Desktop if the new project does not appear immediately."
+        result["note"] = "Codex Desktop is currently open; restart Codex Desktop if the new project does not appear immediately."
     return result

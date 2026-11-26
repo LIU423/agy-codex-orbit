@@ -320,7 +320,8 @@ class SessionStore:
             state = RolloutParseState(path=path)
             self._states_by_path[path] = state
         state.feed_file()
-        self._path_by_session_id[state.session_id] = path
+        if not state.is_subagent or state.session_id not in self._path_by_session_id:
+            self._path_by_session_id[state.session_id] = path
         return state
 
     @staticmethod
@@ -358,11 +359,16 @@ class SessionStore:
         summaries: list[SessionSummary] = []
         seen_session_ids: set[str] = set()
 
-        scan_cap = max(limit, 200) if q else max(1, limit)
+        scan_cap = max(limit * 3, 300) if q else max(limit * 3, 240)
         for _, path in files[:scan_cap]:
             try:
                 state = self._ensure_state(path)
             except OSError:
+                continue
+            # Hide internal Codex subagent child rollouts from the top-level list.
+            if state.is_subagent:
+                continue
+            if state.session_id in seen_session_ids:
                 continue
             summary = state.build_summary(
                 indexed_title=self._index_titles.get(state.session_id),
@@ -373,6 +379,8 @@ class SessionStore:
             seen_session_ids.add(summary.session_id)
             if self._matches_query(summary, q):
                 summaries.append(summary)
+                if not q and len(summaries) >= limit:
+                    break
 
         # Include delegated runs not yet flushed to a rollout file.
         seen_records: set[str] = set()

@@ -99,3 +99,132 @@ def test_delegate_cli_missing_codex_binary_returns_clean_error(tmp_path: Path) -
     assert code == 2
     assert summary["status"] == "failed"
     assert "not found" in summary["error"].lower()
+
+
+def _make_stub_codex(tmp_path: Path, name: str, py_body: str) -> Path:
+    stub_py = tmp_path / f"{name}.py"
+    stub_py.write_text(py_body, encoding="utf-8")
+    if sys.platform == "win32":
+        wrapper = tmp_path / f"{name}.cmd"
+        wrapper.write_text(f'@echo off\n"{sys.executable}" "{stub_py}" %*\n', encoding="utf-8")
+        return wrapper
+    wrapper = tmp_path / f"{name}.sh"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{stub_py}" "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def test_delegate_cli_heavy_stderr_does_not_deadlock(tmp_path: Path) -> None:
+    """Emit >128 KB to stderr before stdout JSON events; file-backed stderr must never deadlock."""
+    sid = "dddddddd-1111-2222-3333-444444444444"
+    fake_codex = _make_stub_codex(
+        tmp_path,
+        "heavy_stderr_codex",
+        f"""
+import json, pathlib, sys
+args = sys.argv[1:]
+_ = sys.stdin.read()
+# Write 200 KB to stderr (far exceeding Windows 4 KB anonymous pipe buffer)
+sys.stderr.write("WARN verbose subagent debug line\\n" * 6500)
+sys.stderr.flush()
+out_file = None
+for idx, a in enumerate(args):
+    if a in ("-o", "--output-last-message") and idx + 1 < len(args):
+        out_file = pathlib.Path(args[idx + 1])
+for ev in (
+    {{"type": "thread.started", "thread_id": "{sid}"}},
+    {{"type": "turn.started", "turn_id": "t1"}},
+    {{"type": "item.completed", "item": {{"type": "agent_message", "text": "Heavy stderr ok"}}}},
+    {{"type": "turn.completed"}},
+):
+    print(json.dumps(ev), flush=True)
+if out_file:
+    out_file.write_text("Heavy stderr ok", encoding="utf-8")
+""",
+    )
+    args = parse_args(
+        [
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "read-only",
+            "--prompt",
+            "Test heavy stderr",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--codex-bin",
+            str(fake_codex),
+            "--no-desktop-project-sync",
+            "--timeout",
+            "15",
+        ]
+    )
+    code, summary = run_delegation(args)
+    assert code == 0
+    assert summary["status"] == "completed"
+    assert summary["final_summary"] == "Heavy stderr ok"
+
+
+def test_delegate_cli_cleans_up_lingering_process_after_turn_completed(tmp_path: Path) -> None:
+    """If Codex hangs on shutdown after emitting turn.completed, delegate_cli completes cleanly after grace period."""
+    sid = "eeeeeeee-1111-2222-3333-444444444444"
+    pid_file = tmp_path / "lingering.pid"
+    fake_codex = _make_stub_codex(
+        tmp_path,
+        "lingering_codex",
+        f"""
+import json, os, pathlib, sys, time
+args = sys.argv[1:]
+_ = sys.stdin.read()
+pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding="utf-8")
+out_file = None
+for idx, a in enumerate(args):
+    if a in ("-o", "--output-last-message") and idx + 1 < len(args):
+        out_file = pathlib.Path(args[idx + 1])
+for ev in (
+    {{"type": "thread.started", "thread_id": "{sid}"}},
+    {{"type": "turn.started", "turn_id": "t1"}},
+    {{"type": "item.completed", "item": {{"type": "agent_message", "text": "Report written cleanly"}}}},
+    {{"type": "turn.completed"}},
+):
+    print(json.dumps(ev), flush=True)
+if out_file:
+    out_file.write_text("Report written cleanly", encoding="utf-8")
+# Simulate Tokio / multi-agent shutdown hang after completion
+time.sleep(60)
+""",
+    )
+    args = parse_args(
+        [
+            "--cwd",
+            str(tmp_path),
+            "--mode",
+            "read-only",
+            "--prompt",
+            "Test post-turn hang cleanup",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--codex-bin",
+            str(fake_codex),
+            "--no-desktop-project-sync",
+            "--post-turn-grace",
+            "1.0",
+            "--timeout",
+            "20",
+        ]
+    )
+    t0 = time.monotonic()
+    code, summary = run_delegation(args)
+    elapsed = time.monotonic() - t0
+    assert code == 0
+    assert summary["status"] == "completed"
+    assert summary["final_summary"] == "Report written cleanly"
+    assert summary["warning"] is not None
+    assert elapsed < 10.0
+
+    # Verify lingering codex process was actually terminated
+    lingering_pid = int(pid_file.read_text(encoding="utf-8").strip())
+    deadline = time.monotonic() + 3.0
+    while is_process_alive(lingering_pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not is_process_alive(lingering_pid)

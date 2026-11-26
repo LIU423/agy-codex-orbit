@@ -255,6 +255,10 @@ class RolloutParseState:
     model: str | None = None
     reasoning_effort: str | None = None
     originator: str | None = None
+    is_subagent: bool = False
+    parent_thread_id: str | None = None
+    agent_nickname: str | None = None
+    agent_path: str | None = None
     started_at: str | None = None
     last_event_at: str | None = None
     total_tokens: int = 0
@@ -353,6 +357,10 @@ class RolloutParseState:
         self.model = None
         self.reasoning_effort = None
         self.originator = None
+        self.is_subagent = False
+        self.parent_thread_id = None
+        self.agent_nickname = None
+        self.agent_path = None
         self.started_at = None
         self.last_event_at = None
         self.total_tokens = 0
@@ -386,9 +394,40 @@ class RolloutParseState:
             self._handle_response_item(payload, timestamp)
 
     def _handle_session_meta(self, pl: dict[str, Any], timestamp: str | None) -> None:
-        sid = pl.get("session_id") or pl.get("id")
+        # Prefer `id` (this thread's own UUID) over `session_id` (which on subagent
+        # rollouts points to the parent session UUID).
+        sid = pl.get("id") or pl.get("session_id")
         if isinstance(sid, str) and sid:
             self.session_id = sid
+
+        parent_id = pl.get("parent_thread_id")
+        src = pl.get("source")
+        spawn_info = (
+            src.get("subagent", {}).get("thread_spawn")
+            if isinstance(src, dict) and isinstance(src.get("subagent"), dict)
+            else None
+        )
+        if not parent_id and isinstance(spawn_info, dict):
+            parent_id = spawn_info.get("parent_thread_id")
+        if isinstance(parent_id, str) and parent_id:
+            self.parent_thread_id = parent_id
+            self.is_subagent = True
+        elif isinstance(src, dict) and "subagent" in src:
+            self.is_subagent = True
+        elif isinstance(src, str) and "subagent" in src.lower():
+            self.is_subagent = True
+
+        nickname = pl.get("agent_nickname") or (
+            spawn_info.get("agent_nickname") if isinstance(spawn_info, dict) else None
+        )
+        if isinstance(nickname, str) and nickname:
+            self.agent_nickname = nickname
+        apath = pl.get("agent_path") or (
+            spawn_info.get("agent_path") if isinstance(spawn_info, dict) else None
+        )
+        if isinstance(apath, str) and apath:
+            self.agent_path = apath
+
         cwd = pl.get("cwd")
         if isinstance(cwd, str) and cwd:
             self.cwd = cwd

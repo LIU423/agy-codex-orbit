@@ -14,10 +14,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -36,6 +38,7 @@ from server.codex_desktop import (
 from server.codex_locator import CodexBinaryNotFoundError, locate_codex_binary
 from server.delegation_store import DelegationStore
 from server.models import IsolationMode
+from server.process_control import terminate_process_tree
 from server.routing_policy import (
     DEFAULT_ROUTING_MODE,
     ROUTING_MODE_LABELS,
@@ -53,6 +56,7 @@ VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 MAX_FINAL_SUMMARY_CHARS = 1800
 MAX_ERROR_CHARS = 600
 MAX_CHANGED_FILES = 60
+DEFAULT_POST_TURN_GRACE_SECONDS = 15.0
 
 
 def _clip(text: str, limit: int) -> str:
@@ -243,6 +247,11 @@ def _parse_json_event(
                 if joined:
                     state["last_agent_message"] = joined
 
+    elif ev_type == "turn.completed":
+        state["turn_completed"] = True
+        if state["turn_finished_mono"] is None:
+            state["turn_finished_mono"] = time.monotonic()
+
     elif ev_type in ("turn.failed", "error"):
         err = rec.get("error") or rec.get("message")
         if isinstance(err, dict):
@@ -250,6 +259,10 @@ def _parse_json_event(
         else:
             msg = str(err or "Codex turn failed")
         state["error"] = _clip(msg, MAX_ERROR_CHARS)
+        if ev_type == "turn.failed":
+            state["turn_failed"] = True
+            if state["turn_finished_mono"] is None:
+                state["turn_finished_mono"] = time.monotonic()
 
 
 def _read_prompt(args: argparse.Namespace) -> str:
@@ -422,7 +435,15 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "changed_files": set(),
         "last_agent_message": "",
         "error": None,
+        "turn_completed": False,
+        "turn_failed": False,
+        "turn_finished_mono": None,
     }
+
+    # Redirect stderr to a temp file rather than PIPE to prevent Windows 4 KB
+    # anonymous pipe buffer deadlocks when Codex emits verbose warnings/subagent logs.
+    stderr_file = tmp_dir / "stderr.log"
+    stderr_fh = stderr_file.open("w+", encoding="utf-8", errors="replace")
 
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
     proc = subprocess.Popen(
@@ -430,7 +451,7 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         cwd=str(exec_cwd),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=stderr_fh,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -440,17 +461,115 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
     assert proc.stdin is not None
     assert proc.stdout is not None
-    assert proc.stderr is not None
 
     try:
         proc.stdin.write(prompt)
+        proc.stdin.flush()
         proc.stdin.close()
     except OSError:
         pass
 
+    line_queue: queue.Queue[str | None] = queue.Queue()
+    early_sync_lock = threading.Lock()
+    early_sync_started = False
+    early_title_info: dict[str, Any] | None = None
+    early_project_info: dict[str, Any] | None = None
+
+    def _trigger_early_desktop_sync(bound_session_id: str) -> None:
+        nonlocal early_sync_started
+        if args.no_desktop_project_sync or not bound_session_id:
+            return
+        with early_sync_lock:
+            if early_sync_started:
+                return
+            early_sync_started = True
+
+        def _worker() -> None:
+            nonlocal early_title_info, early_project_info
+            try:
+                t_info: dict[str, Any] | None = None
+                if round_rec.round_index == 1 or args.title:
+                    t_info = set_codex_thread_name(
+                        bound_session_id,
+                        agy_title,
+                        codex_bin=codex_bin,
+                        use_rpc=not args.codex_bin,
+                    )
+                p_info = ensure_codex_project_and_bind(
+                    workspace_dir,
+                    bound_session_id,
+                    codex_bin=codex_bin,
+                    allow_create=True,
+                    use_rpc=not args.codex_bin,
+                )
+                with early_sync_lock:
+                    early_title_info = t_info
+                    early_project_info = p_info
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, name="codex-desktop-early-sync", daemon=True).start()
+
+    def _read_stdout_lines() -> None:
+        try:
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line_queue.put(raw_line)
+        except OSError:
+            pass
+        finally:
+            line_queue.put(None)
+
+    reader = threading.Thread(target=_read_stdout_lines, name="codex-stdout-reader", daemon=True)
+    reader.start()
+
+    post_turn_grace = max(0.5, float(getattr(args, "post_turn_grace", DEFAULT_POST_TURN_GRACE_SECONDS)))
+    hard_deadline = time.monotonic() + max(1, int(args.timeout))
+    last_msg_seen_mono: float | None = None
+    last_stdout_mono = time.monotonic()
+    forced_post_turn_exit = False
+    warning_note: str | None = None
+    exit_code: int = 1
+
     try:
-        for raw_line in proc.stdout:
-            line = raw_line.strip()
+        while True:
+            now = time.monotonic()
+            if now >= hard_deadline:
+                terminate_process_tree(proc.pid, wait_seconds=2.0)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                exit_code = 124
+                state["error"] = f"Codex delegation timed out after {args.timeout}s."
+                break
+
+            if state["turn_finished_mono"] is not None:
+                if (now - state["turn_finished_mono"]) >= post_turn_grace:
+                    forced_post_turn_exit = True
+                    break
+            elif last_msg_file.is_file():
+                try:
+                    if last_msg_file.stat().st_size > 0:
+                        if last_msg_seen_mono is None:
+                            last_msg_seen_mono = now
+                        elif (now - last_msg_seen_mono) >= post_turn_grace and (now - last_stdout_mono) >= post_turn_grace:
+                            forced_post_turn_exit = True
+                            break
+                except OSError:
+                    pass
+
+            try:
+                raw_item = line_queue.get(timeout=0.25)
+            except queue.Empty:
+                if proc.poll() is not None and not reader.is_alive():
+                    break
+                continue
+
+            if raw_item is None:
+                break
+            last_stdout_mono = time.monotonic()
+            line = raw_item.strip()
             if not line:
                 continue
             try:
@@ -459,20 +578,65 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 continue
             if isinstance(rec, dict):
                 _parse_json_event(rec, state=state, store=store, run_id=run_id)
-        exit_code = proc.wait(timeout=args.timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-        exit_code = 124
-        state["error"] = f"Codex delegation timed out after {args.timeout}s."
+                if state["session_id"] and not early_sync_started:
+                    _trigger_early_desktop_sync(state["session_id"])
+
+        if forced_post_turn_exit:
+            terminate_process_tree(proc.pid, wait_seconds=2.0)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            has_output_msg = bool(state["last_agent_message"]) or (
+                last_msg_file.is_file() and last_msg_file.stat().st_size > 0
+            )
+            if (state["turn_completed"] or has_output_msg) and not state["turn_failed"] and not state["error"]:
+                exit_code = 0
+                warning_note = (
+                    "Codex CLI did not exit after completing the turn; lingering process tree was cleaned up automatically."
+                )
+            else:
+                exit_code = proc.returncode if proc.returncode is not None else 1
+        elif exit_code != 124:
+            remaining = max(1.0, min(post_turn_grace, hard_deadline - time.monotonic()))
+            try:
+                exit_code = proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                terminate_process_tree(proc.pid, wait_seconds=2.0)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                has_output_msg = bool(state["last_agent_message"]) or (
+                    last_msg_file.is_file() and last_msg_file.stat().st_size > 0
+                )
+                if (state["turn_completed"] or has_output_msg) and not state["turn_failed"] and not state["error"]:
+                    exit_code = 0
+                    warning_note = (
+                        "Codex CLI closed stdout but did not exit in time; lingering process tree was cleaned up automatically."
+                    )
+                else:
+                    exit_code = 124
+                    state["error"] = f"Codex delegation timed out waiting for process exit."
     except KeyboardInterrupt:
-        proc.terminate()
+        terminate_process_tree(proc.pid, wait_seconds=1.5)
         exit_code = 130
         state["error"] = "Delegation interrupted."
+    finally:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+        try:
+            stderr_fh.close()
+        except OSError:
+            pass
 
     stderr_text = ""
     try:
-        stderr_text = proc.stderr.read().strip()
+        if stderr_file.is_file():
+            raw_err = stderr_file.read_text(encoding="utf-8", errors="replace").strip()
+            stderr_text = raw_err[-4000:] if len(raw_err) > 4000 else raw_err
     except OSError:
         pass
 
@@ -486,27 +650,34 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             pass
     try:
         last_msg_file.unlink(missing_ok=True)
+        stderr_file.unlink(missing_ok=True)
         tmp_dir.rmdir()
     except OSError:
         pass
 
     # Sync `agy:` thread title and Codex Desktop project binding once session_id is known.
-    codex_project_info: dict[str, Any] | None = None
-    title_sync_info: dict[str, Any] | None = None
+    # Reuses early sync if already completed, and performs idempotent final confirmation so
+    # threads created mid-run are guaranteed bound even if SQLite hadn't flushed at thread.started.
+    with early_sync_lock:
+        codex_project_info: dict[str, Any] | None = early_project_info
+        title_sync_info: dict[str, Any] | None = early_title_info
     bound_sid = state["session_id"]
     if bound_sid and not args.no_desktop_project_sync:
-        if round_rec.round_index == 1 or args.title:
+        if (round_rec.round_index == 1 or args.title) and not (title_sync_info and title_sync_info.get("via_rpc")):
             title_sync_info = set_codex_thread_name(
                 bound_sid,
                 agy_title,
                 codex_bin=codex_bin,
                 use_rpc=not args.codex_bin,
             )
-        codex_project_info = ensure_codex_project_and_bind(
-            workspace_dir,
-            bound_sid,
-            allow_create=True,
-        )
+        if not (codex_project_info and codex_project_info.get("bound")):
+            codex_project_info = ensure_codex_project_and_bind(
+                workspace_dir,
+                bound_sid,
+                codex_bin=codex_bin,
+                allow_create=True,
+                use_rpc=not args.codex_bin,
+            )
 
     changed_files_set: set[str] = set(state["changed_files"])
     if isolation_mode != "read-only":
@@ -562,6 +733,7 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "codex_project": codex_project_info,
         "title_sync": title_sync_info,
         "final_summary": clipped_final,
+        "warning": warning_note,
         "error": error_summary,
     }
     return (0 if final_status == "completed" else 1), summary
@@ -619,6 +791,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--data-dir", default=None, help="Override Codex Orbit plugin data directory")
     parser.add_argument("--codex-bin", default=None, help="Override path to codex executable")
     parser.add_argument("--timeout", type=int, default=1800, help="Timeout in seconds (default: 1800)")
+    parser.add_argument(
+        "--post-turn-grace",
+        type=float,
+        default=DEFAULT_POST_TURN_GRACE_SECONDS,
+        help="Seconds to wait for Codex CLI to exit after turn.completed before cleaning up lingering process tree",
+    )
     parser.add_argument(
         "--no-desktop-project-sync",
         action="store_true",

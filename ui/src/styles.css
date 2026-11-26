@@ -1439,7 +1439,7 @@ details[open] > summary .chevron {
 }
 
 .hm-wrap {
-  --hm-0: var(--bg-2);
+  --hm-0: #ebedf0;
   --hm-1: #dbeafe;
   --hm-2: #93c5fd;
   --hm-3: #3b82f6;
@@ -1454,15 +1454,33 @@ details[open] > summary .chevron {
   --hm-4: #5b21b6;
 }
 
+[data-theme="dark"] .hm-wrap,
+.dark .hm-wrap {
+  --hm-0: rgba(255, 255, 255, 0.08);
+  --hm-1: #172554;
+  --hm-2: #1e40af;
+  --hm-3: #2563eb;
+  --hm-4: #60a5fa;
+}
+
+[data-theme="dark"] .hm-wrap.palette-agy,
+.dark .hm-wrap.palette-agy {
+  --hm-1: #2e1065;
+  --hm-2: #5b21b6;
+  --hm-3: #7c3aed;
+  --hm-4: #a78bfa;
+}
+
 @media (prefers-color-scheme: dark) {
-  .hm-wrap {
+  :root:not([data-theme="light"]) .hm-wrap {
+    --hm-0: rgba(255, 255, 255, 0.08);
     --hm-1: #172554;
     --hm-2: #1e40af;
     --hm-3: #2563eb;
     --hm-4: #60a5fa;
   }
 
-  .hm-wrap.palette-agy {
+  :root:not([data-theme="light"]) .hm-wrap.palette-agy {
     --hm-1: #2e1065;
     --hm-2: #5b21b6;
     --hm-3: #7c3aed;
@@ -1472,12 +1490,11 @@ details[open] > summary .chevron {
 
 .hm-scroll {
   overflow-x: auto;
-  padding-bottom: 4px;
+  padding-bottom: 6px;
 }
 
 .hm-inner {
-  width: max-content;
-  min-width: 100%;
+  margin: 0 auto;
 }
 
 .hm-grid {
@@ -1855,5 +1872,9 @@ details[open] > summary .chevron {
 
   .kpi-cell + .kpi-cell::before {
     display: none;
+  }
+
+  .kpi-cell:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
   }
 }

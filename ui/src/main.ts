@@ -119,6 +119,7 @@ let searchDebounce: number | null = null;
 let toastTimer: number | null = null;
 let listDirty = true;
 let detailDirty = true;
+let hmScrollInitialized = false;
 
 function activeLocale(): ResolvedLocale {
   return resolveLocale(state.uiLocale, state.hostLocale);
@@ -1075,6 +1076,7 @@ function openOverview(): void {
   state.selectedSessionId = null;
   state.detail = null;
   state.sidebarOpen = false;
+  hmScrollInitialized = false;
   listDirty = true;
   detailDirty = true;
   updateSidebarChrome();
@@ -1327,6 +1329,8 @@ function render(scrollBottom = false): void {
       document.getElementById("detail-scroll")?.scrollTop ??
       document.querySelector(".overview-scroll")?.scrollTop ??
       0;
+    const prevHmScrollEl = document.querySelector<HTMLElement>(".hm-scroll");
+    const prevHmScrollLeft = prevHmScrollEl ? prevHmScrollEl.scrollLeft : null;
     const openFoldKeys = new Set<string>();
     if (mainEl) {
       mainEl.querySelectorAll<HTMLDetailsElement>("details[data-fold-key][open]").forEach((el) => {
@@ -1352,6 +1356,15 @@ function render(scrollBottom = false): void {
     } else {
       const ovScroller = document.querySelector(".overview-scroll");
       if (ovScroller) ovScroller.scrollTop = prevScroll;
+      const hmScroller = document.querySelector<HTMLElement>(".hm-scroll");
+      if (hmScroller) {
+        if (!hmScrollInitialized || prevHmScrollLeft === null) {
+          hmScroller.scrollLeft = hmScroller.scrollWidth;
+          hmScrollInitialized = true;
+        } else {
+          hmScroller.scrollLeft = prevHmScrollLeft;
+        }
+      }
     }
   }
 }

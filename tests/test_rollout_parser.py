@@ -239,3 +239,96 @@ def test_large_output_truncation_and_file_reset_recovery(tmp_path: Path) -> None
     assert delta.reset is True
     assert delta.cursor < old_cursor
     assert delta.updated_turns[0].assistant_messages[0].text == "Reset ok"
+
+
+def test_subagent_rollouts_do_not_duplicate_or_hijack_parent_session(tmp_path: Path) -> None:
+    day_dir = tmp_path / "sessions" / "2026" / "11" / "26"
+    day_dir.mkdir(parents=True)
+
+    parent_id = "11111111-aaaa-bbbb-cccc-000000000000"
+    parent_file = day_dir / f"rollout-2026-11-26T14-00-00-{parent_id}.jsonl"
+    parent_records = [
+        {
+            "timestamp": "2026-11-26T14:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": parent_id,
+                "session_id": parent_id,
+                "cwd": "D:\\work\\research-space",
+                "source": "exec",
+                "originator": "codex_exec",
+            },
+        },
+        {
+            "timestamp": "2026-11-26T14:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "parent-t1", "started_at": 1795615201},
+        },
+        {
+            "timestamp": "2026-11-26T14:00:05Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "parent-t1",
+                "last_agent_message": "Parent synthesized report.",
+                "duration_ms": 4000,
+            },
+        },
+    ]
+    parent_file.write_text("\n".join(json.dumps(r) for r in parent_records) + "\n", encoding="utf-8")
+
+    # Simulate 3 Codex subagents whose `session_id` equals parent_id while `id` is their own UUID.
+    for idx, (child_id, nick, apath) in enumerate(
+        [
+            ("22222222-aaaa-bbbb-cccc-000000000001", "Chandrasekhar", "/root/company"),
+            ("22222222-aaaa-bbbb-cccc-000000000002", "Hypatia", "/root/models"),
+            ("22222222-aaaa-bbbb-cccc-000000000003", "Noether", "/root/hiring"),
+        ],
+        start=1,
+    ):
+        child_file = day_dir / f"rollout-2026-11-26T14-00-0{idx}-{child_id}.jsonl"
+        child_records = [
+            {
+                "timestamp": f"2026-11-26T14:00:0{idx}Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": child_id,
+                    "session_id": parent_id,
+                    "parent_thread_id": parent_id,
+                    "agent_nickname": nick,
+                    "agent_path": apath,
+                    "cwd": "D:\\work\\research-space",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": parent_id,
+                                "depth": 1,
+                                "agent_path": apath,
+                                "agent_nickname": nick,
+                            }
+                        }
+                    },
+                    "originator": "codex_exec",
+                },
+            },
+            {
+                "timestamp": f"2026-11-26T14:00:1{idx}Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": f"child-t{idx}",
+                    "last_agent_message": f"Subagent {nick} notes.",
+                    "duration_ms": 1000,
+                },
+            },
+        ]
+        child_file.write_text("\n".join(json.dumps(r) for r in child_records) + "\n", encoding="utf-8")
+
+    store = SessionStore(sessions_dir=tmp_path / "sessions")
+    listed = store.list_sessions()
+    assert len(listed) == 1
+    assert listed[0].session_id == parent_id
+
+    detail, _ = store.get_session_detail(parent_id)
+    assert detail is not None
+    assert detail.turns[0].assistant_messages[-1].text == "Parent synthesized report."
