@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "codex_orbit": {
+      "command": "${PLUGIN_ROOT}/.venv/Scripts/python.exe",
+      "args": [
+        "-u",
+        "${PLUGIN_ROOT}/server/main.py",
+        "--data-dir=${PLUGIN_DATA}"
+      ],
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}

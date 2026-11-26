@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / UI build deps
+ui/node_modules/
+ui/.vite/
+
+# Local runtime state & secrets (never commit)
+.local/
+*.log
+.env
+.env.*
