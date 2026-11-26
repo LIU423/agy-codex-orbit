@@ -1,75 +1,112 @@
 ---
 name: codex-delegation
-description: Delegate scoped coding, refactoring, testing, or read-only code review tasks to local OpenAI Codex CLI with workspace isolation, multi-turn resume, zero-token live monitoring in Codex Orbit, and compact summary return.
+description: Delegate backend coding, testing, debugging, read-only code review, or live web-search research tasks to local OpenAI Codex CLI using the static GPT-6.2 model routing & prompting profile, same-workspace serial handoff, Codex Desktop project + `agy:` thread naming, quota-aware Astra escalation, and zero-token monitoring in Codex Orbit.
 ---
 
 # Codex Delegation Workflow
 
-Use this skill when delegating a well-scoped medium or large coding, testing, debugging, or independent code review task to local OpenAI Codex CLI while keeping Gemini's context window clean and monitoring progress in **Codex Orbit**.
+Use this skill to route backend/systems work to local OpenAI Codex CLI while Antigravity (Gemini) handles frontend/UI and orchestration, monitored at zero model tokens in **Codex Orbit**.
 
-## 1. When to Delegate
+Always read [references/model_profile.md](references/model_profile.md) before drafting a delegation brief. **Never** run web searches for model benchmarks during routine delegation; only refresh `references/model_profile.md` when the user explicitly tells you the target model has updated.
 
-- **Delegate**: multi-file feature implementation, isolated refactoring, comprehensive test suites, or independent read-only code review with clear inputs and acceptance criteria.
-- **Do directly (do not delegate)**: trivial 1–5 line edits, quick file reads, or tasks with ambiguous requirements that first need clarification from the user.
+## 1. Division of Labor & 3-Mode Model Routing
 
-## 2. Hard Isolation & Zero-Polling Rules
+1. **Frontend vs. Backend**:
+   - **Gemini (do directly)**: Frontend UI, CSS/layout, visual polish, component interaction, trivial 1–5 line edits, and user-facing orchestration.
+   - **Codex (delegate)**: Backend architecture, APIs, business logic, parsers, persistence/SQL, CLI/systems tooling, complex debugging, backend tests, and independent read-only code reviews.
+2. **Classify Task Tier & Check Active Routing Policy**:
+   - Classify the delegated backend task as `--task-tier light | standard | complex` per [references/model_profile.md](references/model_profile.md).
+   - Resolve the active persisted policy (`silent_low_cost` | `ask` [default] | `silent_best`) before dispatching:
+     ```powershell
+     $rt = Get-Content "$env:LOCALAPPDATA\agy-codex-orbit\runtime.json" -Raw | ConvertFrom-Json
+     & $rt.python_bin -u $rt.delegate_cli --plan-route --task-tier complex --mode workspace-write
+     ```
+   - Follow the returned policy strictly:
+     - **`silent_low_cost`（静默低成本模式）**: Dispatch silently with `gpt-6.2-sol` and the returned effort; never escalate to Astra.
+     - **`ask`（问询模式 — 默认）**: If `requires_confirmation` is `false`, dispatch silently with the returned `model` & `reasoning_effort`. If `requires_confirmation` is `true` (`complex` tier), **DO NOT dispatch yet** — present the recommended `gpt-6.2-astra` vs `gpt-6.2-sol` option together with the returned **Codex 5h & 7d remaining quota + reset times** (and Antigravity quota note), and let the user decide.
+     - **`silent_best`（静默最佳分配模式）**: Dispatch silently with the returned best `model` (`gpt-6.2-astra` for `standard`/`complex`) & `reasoning_effort` without asking.
+3. **Switching Policies via Chat**:
+   - When the user asks to change the routing policy (e.g., "切到静默低成本模式" / "切到问询模式" / "切到静默最佳模式"), persist it immediately so both future turns and the **Codex Orbit** UI stay synchronized:
+     ```powershell
+     $rt = Get-Content "$env:LOCALAPPDATA\agy-codex-orbit\runtime.json" -Raw | ConvertFrom-Json
+     & $rt.python_bin -u $rt.delegate_cli --set-routing-mode silent_best
+     ```
 
-1. **Workspace isolation is mandatory**:
-   - **Code review / audit / investigation**: ALWAYS use `--mode read-only`.
-   - **Code changes inside a Git repository**: ALWAYS use `--mode worktree`. The wrapper creates a dedicated git worktree under `${PLUGIN_DATA}/worktrees/` on round 1 and automatically reuses the same worktree on follow-up rounds, keeping the user's main working tree untouched.
-   - **In-place writes (`--mode workspace-write`)**: ONLY when the target is not a Git repository or the user explicitly asks to edit the current working tree directly.
-2. **Zero polling**:
+## 2. Workspace Sharing, Project Binding & `agy:` Naming
+
+1. **Serial Same-Workspace Default**:
+   - When only one executor edits files at a time (e.g., Codex implements backend → finishes → Gemini builds frontend on top), run directly in the **exact Antigravity workspace directory** with `--mode workspace-write`.
+   - For read-only code review / audits, ALWAYS use `--mode read-only`.
+   - ONLY use `--mode worktree` when Gemini and Codex will **edit code in parallel at the same time** (or when the user explicitly requests branch/worktree isolation).
+2. **Codex Desktop Project & `agy:` Window Title**:
+   - ALWAYS pass `--title "<concise task name>"`. `delegate_cli.py` automatically prefixes it as `agy: <concise task name>` via Codex's official `thread/name/set` RPC, and binds the session into the matching Codex Desktop project for that workspace (creating the project cleanly if missing, with backup & graceful degradation).
+3. **Auto-Open Right Side Pane, Zero Polling & No Auto-Merge/Push**:
    - Launch `delegate_cli.py` via `run_command` with `WaitMsBeforeAsync: 5000` and `NotificationTimeoutSeconds: 600`.
-   - After launching, **stop calling tools and wait** for Antigravity's automatic background task completion notification. NEVER poll logs, status, or files in a loop.
-   - Users monitor real-time progress at zero model token cost in the **Codex Orbit** side pane (you may optionally call `open_codex_orbit` once when starting if the user asked to see the panel).
-3. **Never auto-merge or push**:
-   - After a `worktree` round completes, inspect the returned `changed_files` and `worktree_path` (e.g., `git -C <worktree_path> diff --stat`) and report findings/changes to the user before merging into the main branch.
+   - **Pop open the right auxiliary pane automatically**: In the same turn as launching `delegate_cli.py` (or right after it backgrounds), invoke MCP tool `open_codex_orbit` on server `agy-codex-orbit_codex_orbit` with `{"focus_running": true, "workspace_dir": "<CWD>"}` (for Round 1) or `{"session_id": "<SESSION_ID>", "focus_running": true}` (for follow-up rounds). Antigravity auto-opens or updates the right **Codex Orbit** side pane to display live progress at zero model tokens.
+   - Immediately **stop calling tools and wait** for Antigravity's completion notification. NEVER poll logs or status in a loop.
+   - Never auto-merge or push without explicit user approval.
 
-## 3. Dispatching Round 1 (New Session)
+## 3. Dispatching Round 1 (5-Part GPT-6.2 Brief)
 
-Pass the prompt through **stdin** (using a PowerShell single-quoted here-string) so multiline Unicode prompts never hit Windows command-line quoting or length limits.
-
-Locate the plugin Python interpreter and `delegate_cli.py` automatically from Antigravity's Codex Orbit runtime pointer (`%LOCALAPPDATA%\agy-codex-orbit\runtime.json`, written when the plugin starts):
+Pass the brief via stdin (PowerShell single-quoted here-string) so multiline Unicode prompts never break Windows quoting:
 
 ```powershell
 $rt = Get-Content "$env:LOCALAPPDATA\agy-codex-orbit\runtime.json" -Raw | ConvertFrom-Json
 $prompt = @'
-Task: <clear scoped objective>
+Goal: <concrete backend deliverable>
 
-Context & constraints:
-- Target files / modules: ...
-- Do not modify unrelated files.
-- Acceptance criteria & verification command: ...
+Context & Contracts:
+- Relevant files: ...
+- Shared API / schema contract with frontend: ...
+
+Boundaries (Do Not Touch):
+- Do not modify frontend files under ui/ (owned by Gemini).
+- Keep unrelated files untouched.
+
+Evidence:
+- <error logs, failing tests, or current schema>
+
+Definition of Done & Review Criteria:
+- Run `<verification command>` and verify all tests pass.
+- Report changed files, contract notes for frontend integration, and any residual risks.
 '@
 
 $prompt | & $rt.python_bin -u $rt.delegate_cli `
-  --cwd "<TARGET_WORKSPACE>" `
-  --mode worktree `
+  --cwd "<ANTIGRAVITY_WORKSPACE>" `
+  --mode workspace-write `
+  --model gpt-6.2-sol `
+  --reasoning-effort high `
+  --title "<简洁任务名>" `
   --source-model "Gemini"
 ```
 
-For a **read-only code review**, change `--mode worktree` to `--mode read-only`.
+- For read-only review: change `--mode workspace-write` to `--mode read-only` and `--reasoning-effort medium` (or `high`).
+- For live external web research (e.g., company/market/documentation research in non-Git or Git workspaces such as `Career`):
+  - Pass `--web-search` (enables Codex's native live `web_search` tool via `codex --search`).
+  - When Gemini needs to read and interpret a detailed report (>1,800 chars) for the user, use `--mode workspace-write` and instruct Codex to write the full cited Markdown report to a workspace path (e.g., `research/<topic>.md`). Non-Git workspaces work automatically (`--skip-git-repo-check`). Once Codex finishes, read that Markdown file directly in Antigravity and synthesize/explain it against the user's local context.
+  - When the user prefers zero local files written, use `--mode read-only --web-search`; the user can inspect the full Markdown in **Codex Orbit** and send/attach excerpts back to chat.
+- For multi-part independent backend work, add: `Use subagents as needed to divide and move independent parts forward in parallel.`
 
 ## 4. Multi-Turn Follow-Up (`第 N 轮派单`)
 
-`delegate_cli.py` prints a compact JSON summary containing `session_id`, `round`, `worktree_path`, `changed_files`, `command_count`, `duration_ms`, and `final_summary`.
-
-To send follow-up instructions to the **same** Codex session (preserving conversation context and reusing the exact same git worktree), pass `--session-id <session_id>`:
+Reuse `session_id` returned in Round 1's compact JSON summary (additive delta instructions only):
 
 ```powershell
 $rt = Get-Content "$env:LOCALAPPDATA\agy-codex-orbit\runtime.json" -Raw | ConvertFrom-Json
 $followup = @'
-Round 2 follow-up:
-- Address the edge case in ...
+Follow-up:
+- Address edge case: ...
 - Re-run pytest and report results.
 '@
 
 $followup | & $rt.python_bin -u $rt.delegate_cli `
   --session-id "<SESSION_ID_FROM_ROUND_1>" `
+  --model gpt-6.2-sol `
+  --reasoning-effort high `
   --source-model "Gemini"
 ```
 
 ## 5. Handling the Result
 
-- Consume ONLY the compact JSON summary returned by `delegate_cli.py` (status, duration, changed files, final conclusion/error). Do not dump full raw command stdout into the conversation.
-- If `status` is `"failed"` or `"cancelled"`, report the concise `error` and `session_id` so the user can inspect full logs in **Codex Orbit** or decide whether to resume.
+- Consume ONLY the compact JSON summary returned by `delegate_cli.py` (`status`, `session_id`, `title`, `model`, `reasoning_effort`, `changed_files`, `duration_ms`, `codex_project`, `final_summary`, `error`). Never dump raw command stdout into the conversation.
+- After backend completion in the shared workspace, review the changed files/tests and proceed directly with frontend integration in Gemini if part of the user's request.

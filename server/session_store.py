@@ -79,8 +79,8 @@ def _synthetic_summary_from_delegation(rec: DelegationSessionRecord) -> SessionS
     latest = rec.rounds[-1] if rec.rounds else None
     first = rec.rounds[0] if rec.rounds else None
 
-    title = ""
-    if first and first.prompt.strip():
+    title = (rec.title or "").strip()
+    if not title and first and first.prompt.strip():
         first_line = first.prompt.strip().splitlines()[0].strip()
         title = first_line[:88] + ("..." if len(first_line) > 88 else "")
     if not title:
@@ -207,6 +207,8 @@ def _merge_summary_with_delegation(
         "worktree_path": rec.worktree_path,
         "round_count": max(summary.round_count, len(rec.rounds)),
     }
+    if rec.title and not summary.title.lower().startswith("agy:"):
+        updates["title"] = rec.title
     if rec.workspace_dir:
         project_dir, project_name = _normalize_project_dir(rec.workspace_dir)
         updates["project_dir"] = project_dir

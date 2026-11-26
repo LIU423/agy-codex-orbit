@@ -179,10 +179,12 @@ class DelegationStore:
         prompt: str,
         isolation_mode: IsolationMode,
         source_model: str = "Gemini",
+        title: str | None = None,
         session_id: str | None = None,
         worktree_path: str | None = None,
         worktree_branch: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         pid: int | None = None,
     ) -> tuple[DelegationSessionRecord, DelegationRoundRecord]:
         existing = self.get_by_session_id(session_id, verify_liveness=False) if session_id else None
@@ -196,17 +198,21 @@ class DelegationStore:
                 round_index=round_index,
                 run_id=run_id,
                 source_model=source_model,
+                title=title or existing.title,
                 prompt=prompt,
                 isolation_mode=isolation_mode,
                 workspace_dir=workspace_dir or existing.workspace_dir,
                 worktree_path=eff_worktree,
                 worktree_branch=eff_branch,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 status="running",
                 pid=pid,
                 started_at=now,
             )
             existing.rounds.append(rnd)
+            if title and not existing.title:
+                existing.title = title
             if eff_worktree:
                 existing.worktree_path = eff_worktree
             if eff_branch:
@@ -220,12 +226,14 @@ class DelegationStore:
             round_index=1,
             run_id=run_id,
             source_model=source_model,
+            title=title,
             prompt=prompt,
             isolation_mode=isolation_mode,
             workspace_dir=workspace_dir,
             worktree_path=worktree_path,
             worktree_branch=worktree_branch,
             model=model,
+            reasoning_effort=reasoning_effort,
             status="running",
             pid=pid,
             started_at=now,
@@ -233,6 +241,7 @@ class DelegationStore:
         record = DelegationSessionRecord(
             record_id=record_id,
             session_id=session_id,
+            title=title,
             workspace_dir=workspace_dir,
             worktree_path=worktree_path,
             worktree_branch=worktree_branch,

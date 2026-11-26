@@ -50,12 +50,14 @@ class DelegationRoundRecord(BaseModel):
     round_index: int
     run_id: str
     source_model: str = "Gemini"
+    title: str | None = None
     prompt: str = ""
-    isolation_mode: IsolationMode = "read-only"
+    isolation_mode: IsolationMode = "workspace-write"
     workspace_dir: str = ""
     worktree_path: str | None = None
     worktree_branch: str | None = None
     model: str | None = None
+    reasoning_effort: str | None = None
     status: DelegationStatus = "running"
     pid: int | None = None
     child_pid: int | None = None
@@ -73,10 +75,11 @@ class DelegationRoundRecord(BaseModel):
 class DelegationSessionRecord(BaseModel):
     record_id: str
     session_id: str | None = None
+    title: str | None = None
     workspace_dir: str
     worktree_path: str | None = None
     worktree_branch: str | None = None
-    isolation_mode: IsolationMode = "read-only"
+    isolation_mode: IsolationMode = "workspace-write"
     rounds: list[DelegationRoundRecord] = Field(default_factory=list)
     updated_at: str
 
@@ -113,11 +116,13 @@ class SessionSummary(BaseModel):
     project_name: str
     git_branch: str | None = None
     model: str | None = None
+    reasoning_effort: str | None = None
     originator: str | None = None
     status: SessionStatus = "completed"
     round_count: int = 0
     command_count: int = 0
     changed_file_count: int = 0
+    total_tokens: int = 0
     started_at: str | None = None
     updated_at: str | None = None
     duration_ms: int | None = None

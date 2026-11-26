@@ -175,3 +175,67 @@ def test_response_item_fallback_and_session_index_search(tmp_path: Path) -> None
     assert detail.turns[0].commands[0].exit_code == 0
     assert detail.turns[0].commands[0].duration_ms == 400
     assert detail.turns[0].assistant_messages[0].text == "Workspace is clean."
+
+
+def test_large_output_truncation_and_file_reset_recovery(tmp_path: Path) -> None:
+    day_dir = tmp_path / "sessions" / "2026" / "11" / "26"
+    day_dir.mkdir(parents=True)
+    sid = "bbbbbbbb-1111-2222-3333-444444444444"
+    rollout = day_dir / f"rollout-2026-11-26T12-00-00-{sid}.jsonl"
+
+    huge_out = "X" * 10000
+    lines = [
+        {
+            "timestamp": "2026-11-26T12:00:00Z",
+            "type": "session_meta",
+            "payload": {"session_id": sid, "cwd": "D:\\work\\trunc-test"},
+        },
+        {
+            "timestamp": "2026-11-26T12:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "t1", "started_at": 1795608001},
+        },
+        {
+            "timestamp": "2026-11-26T12:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "turn_id": "t1",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "cmd-big",
+                    "command": ["echo", "big"],
+                    "status": "completed",
+                    "exit_code": 0,
+                    "aggregated_output": huge_out,
+                    "duration": {"secs": 0, "nanos": 50000000},
+                },
+            },
+        },
+    ]
+    rollout.write_text("\n".join(json.dumps(r) for r in lines) + "\n", encoding="utf-8")
+
+    store = SessionStore(sessions_dir=tmp_path / "sessions")
+    detail, _ = store.get_session_detail(sid)
+    assert detail is not None
+    cmd = detail.turns[0].commands[0]
+    assert cmd.output_truncated is True
+    assert len(cmd.output_preview) < 4200
+    old_cursor = detail.cursor
+
+    # Truncate/rewrite file smaller -> poll_session_delta must detect reset cleanly
+    smaller = [
+        lines[0],
+        {
+            "timestamp": "2026-11-26T12:01:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "t1", "last_agent_message": "Reset ok", "duration_ms": 100},
+        },
+    ]
+    rollout.write_text("\n".join(json.dumps(r) for r in smaller) + "\n", encoding="utf-8")
+    delta, _ = store.poll_session_delta(sid, after_cursor=old_cursor)
+    assert delta is not None
+    assert delta.changed is True
+    assert delta.reset is True
+    assert delta.cursor < old_cursor
+    assert delta.updated_turns[0].assistant_messages[0].text == "Reset ok"

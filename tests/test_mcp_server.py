@@ -44,6 +44,11 @@ def test_mcp_app_metadata_and_zero_token_visibility(tmp_path: Path) -> None:
             "orbit_list_sessions",
             "orbit_get_session_detail",
             "orbit_poll_session_delta",
+            "orbit_cancel_delegation",
+            "orbit_get_quota",
+            "orbit_set_routing_mode",
+            "orbit_set_ui_locale",
+            "orbit_get_overview",
         ):
             assert app_only_name in by_name
             meta = by_name[app_only_name].meta or {}
@@ -56,6 +61,15 @@ def test_mcp_app_metadata_and_zero_token_visibility(tmp_path: Path) -> None:
         # Empty-argument entrypoint launch must succeed cleanly.
         open_res = await server.call_tool("open_codex_orbit", {})
         assert open_res.structured_content["initial_session_id"] is None
+        assert open_res.structured_content["focus_running"] is False
+
+        # focus_running bootstrap flags should pass through cleanly when idle.
+        focus_res = await server.call_tool(
+            "open_codex_orbit",
+            {"focus_running": True, "workspace_dir": "D:\\SampleRepo"},
+        )
+        assert focus_res.structured_content["focus_running"] is True
+        assert focus_res.structured_content["preferred_workspace"] == "D:\\SampleRepo"
 
         list_res = await server.call_tool("orbit_list_sessions", {})
         sessions = list_res.structured_content["sessions"]
@@ -73,5 +87,25 @@ def test_mcp_app_metadata_and_zero_token_visibility(tmp_path: Path) -> None:
         )
         assert delta_res.structured_content["found"] is True
         assert delta_res.structured_content["delta"]["changed"] is False
+
+        cancel_res = await server.call_tool(
+            "orbit_cancel_delegation",
+            {"session_id": sid},
+        )
+        assert cancel_res.structured_content["cancelled"] is False
+        assert cancel_res.structured_content["already_finished"] is True
+
+        mode_res = await server.call_tool(
+            "orbit_set_routing_mode",
+            {"routing_mode": "silent_low_cost"},
+        )
+        assert mode_res.structured_content["routing_mode"] == "silent_low_cost"
+        locale_res = await server.call_tool("orbit_set_ui_locale", {"ui_locale": "en"})
+        assert locale_res.structured_content["ui_locale"] == "en"
+        list_after = await server.call_tool("orbit_list_sessions", {})
+        assert list_after.structured_content["routing_mode"] == "silent_low_cost"
+        assert list_after.structured_content["ui_locale"] == "en"
+        ov_res = await server.call_tool("orbit_get_overview", {})
+        assert ov_res.structured_content["kpis"]["total_sessions"] == 1
 
     asyncio.run(_verify())

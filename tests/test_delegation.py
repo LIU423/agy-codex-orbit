@@ -94,7 +94,11 @@ def test_codex_locator_explicit_and_env(tmp_path: Path, monkeypatch: pytest.Monk
         locate_codex_binary(tmp_path / "missing-codex.exe")
 
 
-def test_delegate_cli_worktree_isolation_and_multi_turn_resume(tmp_path: Path) -> None:
+def test_delegate_cli_worktree_isolation_and_multi_turn_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
     repo_dir = tmp_path / "demo-repo"
     _init_temp_git_repo(repo_dir)
     data_dir = tmp_path / "plugin-data"
@@ -108,6 +112,8 @@ def test_delegate_cli_worktree_isolation_and_multi_turn_resume(tmp_path: Path) -
             str(repo_dir),
             "--mode",
             "worktree",
+            "--title",
+            "Parser unit tests",
             "--source-model",
             "Gemini 2.5 Pro",
             "--prompt",
@@ -122,6 +128,9 @@ def test_delegate_cli_worktree_isolation_and_multi_turn_resume(tmp_path: Path) -
     assert code1 == 0
     assert summary1["status"] == "completed"
     assert summary1["session_id"] == sid
+    assert summary1["title"] == "agy: Parser unit tests"
+    assert summary1["model"] == "gpt-6.2-sol"
+    assert summary1["reasoning_effort"] == "high"
     assert summary1["round"] == 1
     assert summary1["isolation_mode"] == "worktree"
     assert summary1["command_count"] == 1
@@ -158,9 +167,126 @@ def test_delegate_cli_worktree_isolation_and_multi_turn_resume(tmp_path: Path) -
     store = DelegationStore(data_dir=data_dir)
     rec = store.get_by_session_id(sid, verify_liveness=False)
     assert rec is not None
+    assert rec.title == "agy: Parser unit tests"
     assert len(rec.rounds) == 2
     assert [r.round_index for r in rec.rounds] == [1, 2]
     assert rec.rounds[0].source_model == "Gemini 2.5 Pro"
+
+
+def test_delegate_cli_same_workspace_default_and_effort_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+    repo_dir = tmp_path / "shared-repo"
+    _init_temp_git_repo(repo_dir)
+    sid = "77777777-aaaa-bbbb-cccc-dddddddddddd"
+    fake_codex = _create_fake_codex_cmd(tmp_path, sid)
+
+    args = parse_args(
+        [
+            "--cwd",
+            str(repo_dir),
+            "--reasoning-effort",
+            "medium",
+            "--prompt",
+            "Goal: Build shared backend endpoint",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--codex-bin",
+            str(fake_codex),
+        ]
+    )
+    code, summary = run_delegation(args)
+    assert code == 0
+    assert summary["isolation_mode"] == "workspace-write"
+    assert summary["worktree_path"] is None
+    assert summary["model"] == "gpt-6.2-sol"
+    assert summary["reasoning_effort"] == "medium"
+    assert summary["title"] == "agy: Build shared backend endpoint"
+    assert summary["web_search"] is False
+    assert (repo_dir / "round1.txt").is_file()
+
+
+def test_delegate_cli_web_search_and_non_git_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+    non_git_dir = tmp_path / "Career"
+    non_git_dir.mkdir(parents=True)
+    sid = "88888888-aaaa-bbbb-cccc-dddddddddddd"
+    fake_codex = _create_fake_codex_cmd(tmp_path, sid)
+
+    # Dry-run checks exact command construction for Round 1 with --web-search
+    dry_args = parse_args(
+        [
+            "--cwd",
+            str(non_git_dir),
+            "--mode",
+            "workspace-write",
+            "--web-search",
+            "--title",
+            "Research Acme Corp",
+            "--prompt",
+            "Research Acme Corp and save report to research/acme.md",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--codex-bin",
+            str(fake_codex),
+            "--dry-run",
+        ]
+    )
+    dry_code, dry_plan = run_delegation(dry_args)
+    assert dry_code == 0
+    assert dry_plan["web_search"] is True
+    assert dry_plan["command"][1:3] == ["--search", "exec"]
+
+    # Dry-run checks Round 2 resume with --web-search
+    resume_dry = parse_args(
+        [
+            "--cwd",
+            str(non_git_dir),
+            "--session-id",
+            sid,
+            "--web-search",
+            "--prompt",
+            "Dig deeper into recent financials",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--codex-bin",
+            str(fake_codex),
+            "--dry-run",
+        ]
+    )
+    res_code, res_plan = run_delegation(resume_dry)
+    assert res_code == 0
+    assert res_plan["web_search"] is True
+    assert res_plan["command"][1:4] == ["--search", "exec", "resume"]
+
+    # Full run in non-Git workspace succeeds cleanly with --web-search
+    live_args = parse_args(
+        [
+            "--cwd",
+            str(non_git_dir),
+            "--mode",
+            "read-only",
+            "--web-search",
+            "--title",
+            "Research Acme Corp",
+            "--prompt",
+            "Research Acme Corp",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--codex-bin",
+            str(fake_codex),
+        ]
+    )
+    code, summary = run_delegation(live_args)
+    assert code == 0
+    assert summary["status"] == "completed"
+    assert summary["web_search"] is True
+    assert summary["title"] == "agy: Research Acme Corp"
 
 
 def test_session_store_merges_pending_and_bound_delegations(tmp_path: Path) -> None:

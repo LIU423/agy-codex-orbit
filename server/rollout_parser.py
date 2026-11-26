@@ -50,6 +50,20 @@ _SKIP_TYPE_MARKERS = (
 _EXEC_TOOL_NAMES = {"exec", "exec_command", "shell", "shell_command"}
 _EXIT_CODE_RE = re.compile(r"(?:Exit code|Process exited with code|exit_code)\s*[:=]\s*(-?\d+)")
 _WALL_TIME_RE = re.compile(r"Wall time:\s*([0-9]+(?:\.[0-9]+)?)\s*seconds?", re.IGNORECASE)
+_SYSTEM_PROMPT_PREFIXES = (
+    "<environment_context>",
+    "# agents.md instructions",
+    "<instructions>",
+    "<permissions instructions>",
+    "<collaboration_mode>",
+    "<user_instructions>",
+    "<developer_instructions>",
+)
+
+
+def _is_system_boilerplate(text: str) -> bool:
+    low = text.lstrip().lower()
+    return any(low.startswith(prefix) for prefix in _SYSTEM_PROMPT_PREFIXES)
 
 
 def _truncate(text: str, limit: int) -> tuple[str, bool]:
@@ -182,10 +196,19 @@ class _TurnAccumulator:
         if status == "running" and stale_idle:
             status = "idle"
 
+        structured_messages = [
+            self.messages_by_id[i] for i in self.message_order if i in self.messages_by_id
+        ]
+        fallback_messages = [
+            self.fallback_messages_by_id[i]
+            for i in self.fallback_message_order
+            if i in self.fallback_messages_by_id
+        ]
+
         if not use_fallback:
             prompt = self.prompt or self.fallback_prompt
             reasoning = [self.reasoning_by_id[i] for i in self.reasoning_order if self.reasoning_by_id.get(i)]
-            messages = [self.messages_by_id[i] for i in self.message_order if i in self.messages_by_id]
+            messages = structured_messages
             commands = [self.commands_by_id[i] for i in self.command_order if i in self.commands_by_id]
         else:
             prompt = self.prompt or self.fallback_prompt
@@ -194,11 +217,7 @@ class _TurnAccumulator:
                 for i in self.fallback_reasoning_order
                 if self.fallback_reasoning_by_id.get(i)
             ]
-            messages = [
-                self.fallback_messages_by_id[i]
-                for i in self.fallback_message_order
-                if i in self.fallback_messages_by_id
-            ]
+            messages = fallback_messages or structured_messages
             commands = [
                 self.fallback_commands_by_id[i]
                 for i in self.fallback_command_order
@@ -234,9 +253,11 @@ class RolloutParseState:
     cwd: str | None = None
     git_branch: str | None = None
     model: str | None = None
+    reasoning_effort: str | None = None
     originator: str | None = None
     started_at: str | None = None
     last_event_at: str | None = None
+    total_tokens: int = 0
     offset: int = 0
     file_mtime_ns: int = 0
     file_size: int = 0
@@ -244,6 +265,7 @@ class RolloutParseState:
     turns_by_id: dict[str, _TurnAccumulator] = field(default_factory=dict)
     turn_order: list[str] = field(default_factory=list)
     active_turn_id: str | None = None
+    spawned_thread_ids: list[str] = field(default_factory=list)
     _synthetic_turn_seq: int = 0
 
     def __post_init__(self) -> None:
@@ -329,14 +351,17 @@ class RolloutParseState:
         self.cwd = None
         self.git_branch = None
         self.model = None
+        self.reasoning_effort = None
         self.originator = None
         self.started_at = None
         self.last_event_at = None
+        self.total_tokens = 0
         self.offset = 0
         self.has_structured_items = False
         self.turns_by_id.clear()
         self.turn_order.clear()
         self.active_turn_id = None
+        self.spawned_thread_ids.clear()
         self._synthetic_turn_seq = 0
 
     def _apply_record(self, rec: dict[str, Any]) -> None:
@@ -387,6 +412,8 @@ class RolloutParseState:
         if isinstance(model, str) and model:
             self.model = model
         effort = pl.get("effort")
+        if isinstance(effort, str) and effort:
+            self.reasoning_effort = effort
         turn_id = pl.get("turn_id") if isinstance(pl.get("turn_id"), str) else None
         if turn_id:
             turn = self._get_or_create_turn(turn_id, timestamp=timestamp)
@@ -405,6 +432,8 @@ class RolloutParseState:
             if isinstance(settings, dict):
                 if isinstance(settings.get("model"), str) and settings["model"]:
                     self.model = settings["model"]
+                if isinstance(settings.get("reasoning_effort"), str) and settings["reasoning_effort"]:
+                    self.reasoning_effort = settings["reasoning_effort"]
                 if isinstance(settings.get("cwd"), str) and settings["cwd"] and not self.cwd:
                     self.cwd = settings["cwd"]
             return
@@ -449,18 +478,22 @@ class RolloutParseState:
 
         if ev_type == "token_count":
             info = pl.get("info")
-            if isinstance(info, dict) and self.active_turn_id and self.active_turn_id in self.turns_by_id:
+            if isinstance(info, dict):
                 total = info.get("total_token_usage") or info.get("last_token_usage")
                 if isinstance(total, dict):
-                    turn = self.turns_by_id[self.active_turn_id]
-                    turn.token_usage = TokenUsageSummary(
-                        input_tokens=int(total.get("input_tokens") or 0),
-                        cached_input_tokens=int(total.get("cached_input_tokens") or 0),
-                        output_tokens=int(total.get("output_tokens") or 0),
-                        reasoning_output_tokens=int(total.get("reasoning_output_tokens") or 0),
-                        total_tokens=int(total.get("total_tokens") or 0),
-                    )
-                    turn.dirty = True
+                    tot_val = int(total.get("total_tokens") or 0)
+                    if tot_val > self.total_tokens:
+                        self.total_tokens = tot_val
+                    if self.active_turn_id and self.active_turn_id in self.turns_by_id:
+                        turn = self.turns_by_id[self.active_turn_id]
+                        turn.token_usage = TokenUsageSummary(
+                            input_tokens=int(total.get("input_tokens") or 0),
+                            cached_input_tokens=int(total.get("cached_input_tokens") or 0),
+                            output_tokens=int(total.get("output_tokens") or 0),
+                            reasoning_output_tokens=int(total.get("reasoning_output_tokens") or 0),
+                            total_tokens=tot_val,
+                        )
+                        turn.dirty = True
             return
 
         if ev_type == "item_completed":
@@ -493,12 +526,18 @@ class RolloutParseState:
 
         if itype == "UserMessage":
             text = _extract_content_text(item.get("content"))
-            if text:
+            if text and not _is_system_boilerplate(text):
                 clipped, _ = _truncate(text, MAX_PROMPT_CHARS)
                 if not turn.prompt:
                     turn.prompt = clipped
                 elif clipped not in turn.prompt:
                     turn.prompt = f"{turn.prompt}\n\n{clipped}"
+            return
+
+        if itype == "SubAgentActivity":
+            child_tid = item.get("agent_thread_id")
+            if isinstance(child_tid, str) and child_tid and child_tid not in self.spawned_thread_ids:
+                self.spawned_thread_ids.append(child_tid)
             return
 
         if itype == "Reasoning":
@@ -583,7 +622,7 @@ class RolloutParseState:
             if not text:
                 return
             if role == "user":
-                if not turn.fallback_prompt and not text.lstrip().startswith("<environment_context>"):
+                if not turn.fallback_prompt and not _is_system_boilerplate(text):
                     turn.fallback_prompt, _ = _truncate(text, MAX_PROMPT_CHARS)
                     turn.dirty = True
             elif role == "assistant":
@@ -730,7 +769,9 @@ class RolloutParseState:
             title = f"Session {self.session_id[:8]}"
 
         latest_duration = turns[-1].duration_ms if turns else None
+        total_duration = sum(t.duration_ms for t in turns if t.duration_ms) or latest_duration
         updated_at = self.last_event_at or _mtime_ns_to_iso(self.file_mtime_ns)
+        inferred_delegated = title.lower().startswith("agy:")
 
         return SessionSummary(
             session_id=self.session_id,
@@ -739,15 +780,19 @@ class RolloutParseState:
             project_name=project_name,
             git_branch=self.git_branch,
             model=self.model or (turns[-1].model if turns else None),
+            reasoning_effort=self.reasoning_effort or (turns[-1].effort if turns else None),
             originator=self.originator,
             status=status,
             round_count=len(turns),
             command_count=total_cmds,
             changed_file_count=len(unique_files),
+            total_tokens=self.total_tokens,
             started_at=self.started_at,
             updated_at=updated_at,
-            duration_ms=latest_duration,
+            duration_ms=total_duration,
             file_size=self.file_size,
+            is_delegated=inferred_delegated,
+            source_model="Gemini" if inferred_delegated else None,
         )
 
     def build_detail(
