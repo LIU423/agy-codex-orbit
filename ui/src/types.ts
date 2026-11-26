@@ -1,4 +1,5 @@
 export type SessionStatus = "running" | "completed" | "aborted" | "idle";
+export type IsolationMode = "read-only" | "worktree" | "workspace-write";
 
 export interface CommandRecord {
   id: string;
@@ -42,6 +43,9 @@ export interface TurnDetail {
   effort?: string | null;
   is_delegated: boolean;
   source_model?: string | null;
+  delegation_round?: number | null;
+  isolation_mode?: IsolationMode | null;
+  worktree_path?: string | null;
   prompt: string;
   started_at?: string | null;
   completed_at?: string | null;
@@ -74,6 +78,9 @@ export interface SessionSummary {
   file_size: number;
   is_delegated: boolean;
   source_model?: string | null;
+  isolation_mode?: IsolationMode | null;
+  worktree_path?: string | null;
+  active_run_id?: string | null;
 }
 
 export interface SessionDetail {

@@ -224,6 +224,20 @@ body {
   font-size: 10.5px;
 }
 
+.meta-chip.delegated {
+  background: var(--bg-info);
+  color: var(--fg-info);
+}
+
+.iso-tag {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-3);
+  color: var(--fg-2);
+  flex-shrink: 0;
+}
+
 .meta-time {
   margin-left: auto;
   font-variant-numeric: tabular-nums;

@@ -54,7 +54,7 @@ def test_incremental_tail_and_incomplete_trailing_line(tmp_path: Path) -> None:
     shutil.copyfile(FIXTURE_PATH, rollout)
 
     store = SessionStore(sessions_dir=tmp_path / "sessions")
-    detail = store.get_session_detail("11111111-2222-3333-4444-555555555555")
+    detail, _ = store.get_session_detail("11111111-2222-3333-4444-555555555555")
     assert detail is not None
     cursor_1 = detail.cursor
 
@@ -70,7 +70,7 @@ def test_incremental_tail_and_incomplete_trailing_line(tmp_path: Path) -> None:
     with rollout.open("a", encoding="utf-8") as fh:
         fh.write(raw_line[:split_at])
 
-    delta_partial = store.poll_session_delta("11111111-2222-3333-4444-555555555555", cursor_1)
+    delta_partial, _ = store.poll_session_delta("11111111-2222-3333-4444-555555555555", cursor_1)
     assert delta_partial is not None
     assert delta_partial.changed is False
     assert delta_partial.cursor == cursor_1
@@ -79,7 +79,7 @@ def test_incremental_tail_and_incomplete_trailing_line(tmp_path: Path) -> None:
     with rollout.open("a", encoding="utf-8") as fh:
         fh.write(raw_line[split_at:] + "\n")
 
-    delta_full = store.poll_session_delta(
+    delta_full, _ = store.poll_session_delta(
         "11111111-2222-3333-4444-555555555555",
         cursor_1,
         now_ts=time.time(),
@@ -168,7 +168,7 @@ def test_response_item_fallback_and_session_index_search(tmp_path: Path) -> None
     assert found[0].title == "Build Script Audit"
     assert found[0].project_name == "alpha-service"
 
-    detail = store.get_session_detail(sid)
+    detail, _ = store.get_session_detail(sid)
     assert detail is not None
     assert detail.turns[0].prompt == "Inspect build script"
     assert detail.turns[0].commands[0].command == "git status --short"

@@ -1,4 +1,4 @@
-"""Typed data models for Codex Orbit session monitoring."""
+"""Typed data models for Codex Orbit session monitoring and delegation."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 
 SessionStatus = Literal["running", "completed", "aborted", "idle"]
 TurnStatus = Literal["running", "completed", "aborted", "idle"]
+IsolationMode = Literal["read-only", "worktree", "workspace-write"]
+DelegationStatus = Literal["running", "completed", "failed", "cancelled"]
 
 
 class CommandRecord(BaseModel):
@@ -44,6 +46,41 @@ class TokenUsageSummary(BaseModel):
     total_tokens: int = 0
 
 
+class DelegationRoundRecord(BaseModel):
+    round_index: int
+    run_id: str
+    source_model: str = "Gemini"
+    prompt: str = ""
+    isolation_mode: IsolationMode = "read-only"
+    workspace_dir: str = ""
+    worktree_path: str | None = None
+    worktree_branch: str | None = None
+    model: str | None = None
+    status: DelegationStatus = "running"
+    pid: int | None = None
+    child_pid: int | None = None
+    started_at: str
+    ended_at: str | None = None
+    duration_ms: int | None = None
+    exit_code: int | None = None
+    turn_id: str | None = None
+    command_count: int = 0
+    changed_files: list[str] = Field(default_factory=list)
+    final_message: str = ""
+    error_summary: str | None = None
+
+
+class DelegationSessionRecord(BaseModel):
+    record_id: str
+    session_id: str | None = None
+    workspace_dir: str
+    worktree_path: str | None = None
+    worktree_branch: str | None = None
+    isolation_mode: IsolationMode = "read-only"
+    rounds: list[DelegationRoundRecord] = Field(default_factory=list)
+    updated_at: str
+
+
 class TurnDetail(BaseModel):
     round_index: int
     turn_id: str
@@ -52,6 +89,9 @@ class TurnDetail(BaseModel):
     effort: str | None = None
     is_delegated: bool = False
     source_model: str | None = None
+    delegation_round: int | None = None
+    isolation_mode: IsolationMode | None = None
+    worktree_path: str | None = None
     prompt: str = ""
     started_at: str | None = None
     completed_at: str | None = None
@@ -84,6 +124,9 @@ class SessionSummary(BaseModel):
     file_size: int = 0
     is_delegated: bool = False
     source_model: str | None = None
+    isolation_mode: IsolationMode | None = None
+    worktree_path: str | None = None
+    active_run_id: str | None = None
 
 
 class SessionDetail(BaseModel):

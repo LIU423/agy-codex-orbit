@@ -39,28 +39,41 @@ export class OrbitApi {
     return extractPayload<ListSessionsResponse>(res as ToolCallResultLike);
   }
 
-  async getSessionDetail(sessionId: string): Promise<SessionDetail | null> {
+  async getSessionDetail(
+    sessionId: string,
+  ): Promise<{ detail: SessionDetail; metaTs: string } | null> {
     const res = await this.app.callServerTool({
       name: "orbit_get_session_detail",
       arguments: { session_id: sessionId },
     });
-    const data = extractPayload<{ found: boolean; detail?: SessionDetail | null }>(
-      res as ToolCallResultLike,
-    );
-    return data.found && data.detail ? data.detail : null;
+    const data = extractPayload<{
+      found: boolean;
+      meta_ts?: string;
+      detail?: SessionDetail | null;
+    }>(res as ToolCallResultLike);
+    if (!data.found || !data.detail) return null;
+    return { detail: data.detail, metaTs: data.meta_ts ?? "" };
   }
 
   async pollSessionDelta(
     sessionId: string,
     afterCursor: number,
-  ): Promise<SessionDelta | null> {
+    afterMetaTs: string,
+  ): Promise<{ delta: SessionDelta; metaTs: string } | null> {
     const res = await this.app.callServerTool({
       name: "orbit_poll_session_delta",
-      arguments: { session_id: sessionId, after_cursor: afterCursor },
+      arguments: {
+        session_id: sessionId,
+        after_cursor: afterCursor,
+        after_meta_ts: afterMetaTs,
+      },
     });
-    const data = extractPayload<{ found: boolean; delta?: SessionDelta | null }>(
-      res as ToolCallResultLike,
-    );
-    return data.found && data.delta ? data.delta : null;
+    const data = extractPayload<{
+      found: boolean;
+      meta_ts?: string;
+      delta?: SessionDelta | null;
+    }>(res as ToolCallResultLike);
+    if (!data.found || !data.delta) return null;
+    return { delta: data.delta, metaTs: data.meta_ts ?? "" };
   }
 }

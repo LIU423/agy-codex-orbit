@@ -9,6 +9,7 @@ import type {
   AssistantBlock,
   CommandRecord,
   FileChangeRecord,
+  IsolationMode,
   OpenOrbitBootstrap,
   SessionDetail,
   SessionStatus,
@@ -23,6 +24,7 @@ interface UiState {
   query: string;
   selectedSessionId: string | null;
   detail: SessionDetail | null;
+  detailMetaTs: string;
   autoFollow: boolean;
   showFilesDrawer: boolean;
   sidebarOpen: boolean;
@@ -39,6 +41,7 @@ const state: UiState = {
   query: "",
   selectedSessionId: null,
   detail: null,
+  detailMetaTs: "",
   autoFollow: true,
   showFilesDrawer: false,
   sidebarOpen: false,
@@ -128,6 +131,19 @@ function statusLabel(status: SessionStatus): string {
   }
 }
 
+function isolationLabel(mode?: IsolationMode | null): string {
+  switch (mode) {
+    case "read-only":
+      return "只读";
+    case "worktree":
+      return "Worktree";
+    case "workspace-write":
+      return "工作区写入";
+    default:
+      return "";
+  }
+}
+
 function shortFileName(filePath: string): string {
   const parts = filePath.replace(/\\/g, "/").split("/");
   if (parts.length <= 2) return filePath;
@@ -180,6 +196,9 @@ function renderSidebarList(): string {
         : g.items
             .map((s) => {
               const active = s.session_id === state.selectedSessionId ? " active" : "";
+              const delegatedChip = s.is_delegated
+                ? `<span class="meta-chip delegated" title="由 ${escapeHtml(s.source_model || "Gemini")} 派单">${escapeHtml(s.source_model || "Gemini")}</span>`
+                : "";
               const modelChip = s.model
                 ? `<span class="meta-chip" title="${escapeHtml(s.model)}">${escapeHtml(s.model)}</span>`
                 : "";
@@ -192,6 +211,7 @@ function renderSidebarList(): string {
                     <span class="session-title">${escapeHtml(s.title)}</span>
                   </div>
                   <div class="session-meta">
+                    ${delegatedChip}
                     ${modelChip}
                     <span>${roundText}</span>
                     <span class="meta-time">${escapeHtml(timeText)}</span>
@@ -248,11 +268,16 @@ function renderFileChip(fc: FileChangeRecord): string {
 }
 
 function renderTurnCard(turn: TurnDetail, isLatest: boolean): string {
+  const displayRound = turn.delegation_round ?? turn.round_index;
   const roundLabel = turn.is_delegated
-    ? `第 ${turn.round_index} 轮派单`
+    ? `第 ${displayRound} 轮派单`
     : `第 ${turn.round_index} 轮`;
   const sourceBadge = turn.source_model
     ? `<span class="source-tag">${escapeHtml(turn.source_model)}</span>`
+    : "";
+  const isoText = isolationLabel(turn.isolation_mode);
+  const isoBadge = isoText
+    ? `<span class="iso-tag" title="${escapeHtml(turn.worktree_path || isoText)}">${escapeHtml(isoText)}</span>`
     : "";
   const promptOneLine = turn.prompt
     ? turn.prompt.replace(/\s+/g, " ").trim()
@@ -306,6 +331,7 @@ function renderTurnCard(turn: TurnDetail, isLatest: boolean): string {
           <span class="chevron">▸</span>
           <span class="round-tag">${roundLabel}</span>
           ${sourceBadge}
+          ${isoBadge}
           <span class="prompt-preview">${escapeHtml(promptOneLine)}</span>
           <span class="turn-right-meta">
             ${modelMeta}
@@ -337,6 +363,8 @@ function renderDetailPane(): string {
   if (d) {
     topSubParts.push(d.summary.project_dir);
     if (d.summary.git_branch) topSubParts.push(`@${d.summary.git_branch}`);
+    const iso = isolationLabel(d.summary.isolation_mode);
+    if (iso) topSubParts.push(iso);
   }
   const topSub = topSubParts.join("  ·  ");
 
@@ -519,14 +547,16 @@ async function selectSession(sessionId: string): Promise<void> {
   state.selectedSessionId = sessionId;
   state.showFilesDrawer = false;
   state.loadingDetail = true;
+  state.detailMetaTs = "";
   listDirty = true;
   detailDirty = true;
   render();
 
   try {
-    const detail = await api.getSessionDetail(sessionId);
+    const res = await api.getSessionDetail(sessionId);
     if (state.selectedSessionId === sessionId) {
-      state.detail = detail;
+      state.detail = res?.detail ?? null;
+      state.detailMetaTs = res?.metaTs ?? "";
       state.syncState = "live";
       state.syncError = null;
     }
@@ -575,13 +605,19 @@ async function refreshSessions(forceDetailPoll: boolean): Promise<void> {
 async function pollActiveDetail(): Promise<void> {
   if (!api || !state.selectedSessionId || !state.detail) return;
   const sid = state.selectedSessionId;
-  const delta = await api.pollSessionDelta(sid, state.detail.cursor);
-  if (!delta || state.selectedSessionId !== sid) return;
+  const polled = await api.pollSessionDelta(sid, state.detail.cursor, state.detailMetaTs);
+  if (!polled || state.selectedSessionId !== sid) return;
+  const { delta, metaTs } = polled;
 
   state.syncState = "live";
   state.syncError = null;
+  state.detailMetaTs = metaTs;
 
   if (!delta.changed) return;
+
+  if (delta.session_id && delta.session_id !== sid) {
+    state.selectedSessionId = delta.session_id;
+  }
 
   if (delta.reset) {
     state.detail = {

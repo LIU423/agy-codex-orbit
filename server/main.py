@@ -17,6 +17,7 @@ if str(_REPO_ROOT) not in sys.path:
 from mcp import types
 from mcp.server.mcpserver import MCPServer
 
+from server.delegation_store import DelegationStore, resolve_data_dir, runtime_pointer_path
 from server.session_store import SessionStore
 
 APP_URI = "ui://codex-orbit/app.html"
@@ -58,12 +59,18 @@ def _write_runtime_pointer(data_dir: Path | None) -> None:
         return
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
-        local_app = os.environ.get("LOCALAPPDATA")
-        pointer_root = Path(local_app) / "agy-codex-orbit" if local_app else Path.home() / ".agy-codex-orbit"
-        pointer_root.mkdir(parents=True, exist_ok=True)
-        pointer_file = pointer_root / "runtime.json"
+        pointer_file = runtime_pointer_path()
+        pointer_file.parent.mkdir(parents=True, exist_ok=True)
         pointer_file.write_text(
-            json.dumps({"data_dir": str(data_dir.resolve())}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {
+                    "data_dir": str(data_dir.resolve()),
+                    "python_bin": str(Path(sys.executable).resolve()),
+                    "delegate_cli": str((_REPO_ROOT / "server" / "delegate_cli.py").resolve()),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
     except OSError:
@@ -77,15 +84,21 @@ def create_server(
     session_index_path: Path | None = None,
     html_path: Path | None = None,
     data_dir: Path | None = None,
+    write_pointer: bool = False,
 ) -> MCPServer:
-    _write_runtime_pointer(data_dir)
+    resolved_data_dir = resolve_data_dir(data_dir)
+    if write_pointer:
+        _write_runtime_pointer(resolved_data_dir)
+
+    delegation_store = DelegationStore(data_dir=resolved_data_dir)
     store = SessionStore(
         sessions_dir=sessions_dir,
         session_index_path=session_index_path,
+        delegation_store=delegation_store,
     )
     mcp = MCPServer(
         name="Codex Orbit",
-        version="0.1.0",
+        version="0.2.0",
     )
 
     @mcp.resource(
@@ -131,7 +144,7 @@ def create_server(
     @mcp.tool(
         name="orbit_list_sessions",
         title="List Codex sessions",
-        description="App-only tool: list local Codex sessions with optional search filter.",
+        description="App-only tool: list local Codex sessions and active delegations with optional search filter.",
         meta=APP_ONLY_META,
         structured_output=False,
     )
@@ -141,7 +154,7 @@ def create_server(
         payload = {
             "sessions": [s.model_dump(mode="json") for s in sessions],
             "sessions_dir": str(store.sessions_dir),
-            "sessions_dir_exists": store.sessions_dir.exists(),
+            "sessions_dir_exists": store.sessions_dir.exists() or len(sessions) > 0,
         }
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=f"{len(sessions)} sessions")],
@@ -151,14 +164,15 @@ def create_server(
     @mcp.tool(
         name="orbit_get_session_detail",
         title="Get Codex session detail",
-        description="App-only tool: fetch full parsed detail and current byte cursor for a Codex session.",
+        description="App-only tool: fetch full parsed detail, delegation metadata, and current byte cursor.",
         meta=APP_ONLY_META,
         structured_output=False,
     )
     def orbit_get_session_detail(session_id: str) -> types.CallToolResult:
-        detail = store.get_session_detail(session_id)
+        detail, meta_ts = store.get_session_detail(session_id)
         payload = {
             "found": detail is not None,
+            "meta_ts": meta_ts,
             "detail": detail.model_dump(mode="json") if detail is not None else None,
         }
         return types.CallToolResult(
@@ -169,17 +183,23 @@ def create_server(
     @mcp.tool(
         name="orbit_poll_session_delta",
         title="Poll Codex session delta",
-        description="App-only tool: incrementally read appended rollout records after a byte cursor.",
+        description="App-only tool: incrementally read appended rollout records or delegation updates.",
         meta=APP_ONLY_META,
         structured_output=False,
     )
     def orbit_poll_session_delta(
         session_id: str,
         after_cursor: int = 0,
+        after_meta_ts: str = "",
     ) -> types.CallToolResult:
-        delta = store.poll_session_delta(session_id, after_cursor=max(0, after_cursor))
+        delta, meta_ts = store.poll_session_delta(
+            session_id,
+            after_cursor=max(0, after_cursor),
+            after_meta_ts=after_meta_ts,
+        )
         payload = {
             "found": delta is not None,
+            "meta_ts": meta_ts,
             "delta": delta.model_dump(mode="json") if delta is not None else None,
         }
         return types.CallToolResult(
@@ -204,6 +224,7 @@ def main(argv: list[str] | None = None) -> None:
         sessions_dir=Path(args.sessions_dir) if args.sessions_dir else None,
         html_path=Path(args.html_path) if args.html_path else None,
         data_dir=Path(args.data_dir) if args.data_dir else None,
+        write_pointer=True,
     )
     server.run(transport="stdio")
 
