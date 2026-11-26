@@ -40,12 +40,28 @@ def _init_fake_codex_home(tmp_path: Path) -> Path:
             id TEXT PRIMARY KEY,
             name TEXT,
             project_id TEXT,
-            source TEXT
+            source TEXT,
+            rollout_path TEXT
         );
         """
     )
-    conn.execute("INSERT INTO threads (id, name, project_id, source) VALUES (?, ?, ?, ?)", ("sess-1", "", None, "exec"))
-    conn.execute("INSERT INTO threads (id, name, project_id, source) VALUES (?, ?, ?, ?)", ("sess-2", "", None, "exec"))
+    rollout1 = codex_home / "sessions" / "rollout-sess-1.jsonl"
+    rollout1.parent.mkdir(parents=True, exist_ok=True)
+    rollout1.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "sess-1", "source": "exec"}})
+        + "\n"
+        + json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    conn.execute(
+        "INSERT INTO threads (id, name, project_id, source, rollout_path) VALUES (?, ?, ?, ?, ?)",
+        ("sess-1", "", None, "exec", str(rollout1)),
+    )
+    conn.execute(
+        "INSERT INTO threads (id, name, project_id, source, rollout_path) VALUES (?, ?, ?, ?, ?)",
+        ("sess-2", "", None, "exec", None),
+    )
     conn.commit()
     conn.close()
 
@@ -116,6 +132,9 @@ def test_ensure_codex_project_creates_reuses_and_backs_up(tmp_path: Path) -> Non
     assert conn.execute("SELECT position FROM projects WHERE id = ?", (pid,)).fetchone()[0] == 0
     assert conn.execute("SELECT project_id, source FROM threads WHERE id = 'sess-1'").fetchone() == (pid, "vscode")
     conn.close()
+    rollout1_lines = (codex_home / "sessions" / "rollout-sess-1.jsonl").read_text(encoding="utf-8").splitlines()
+    assert json.loads(rollout1_lines[0])["payload"]["source"] == "vscode"
+    assert len(rollout1_lines) == 2
 
     # Verify .codex-global-state.sqlite synced & backed up cleanly
     assert (codex_home / ".codex-global-state.sqlite.agy-orbit.bak").is_file()

@@ -359,6 +359,40 @@ def _is_codex_desktop_running() -> bool:
         return False
 
 
+def _promote_rollout_source_to_interactive(rollout_path_str: str | None) -> bool:
+    """Update line 1 `session_meta.payload.source` from `'exec'` to `'vscode'` atomically.
+
+    `codex app-server` reconciles `threads.source` from the rollout's `session_meta` header
+    and hides `'exec'` threads from Codex Desktop's default interactive `thread/list`.
+    """
+    if not rollout_path_str:
+        return False
+    cleaned = rollout_path_str[4:] if rollout_path_str.startswith("\\\\?\\") else rollout_path_str
+    path = Path(cleaned)
+    if not path.is_file():
+        return False
+    try:
+        with path.open("rb") as fh:
+            first_raw = fh.readline()
+            if not first_raw:
+                return False
+            first_obj = json.loads(first_raw.decode("utf-8", errors="replace"))
+            if not isinstance(first_obj, dict) or first_obj.get("type") != "session_meta":
+                return False
+            pl = first_obj.get("payload")
+            if not isinstance(pl, dict) or pl.get("source") != "exec":
+                return False
+            pl["source"] = "vscode"
+            new_first = (json.dumps(first_obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+            rest = fh.read()
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+        tmp_path.write_bytes(new_first + rest)
+        os.replace(tmp_path, path)
+        return True
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
 def _ensure_sqlite_project(
     db_path: Path,
     norm_path: str,
@@ -367,6 +401,7 @@ def _ensure_sqlite_project(
     *,
     allow_create: bool,
     preferred_id: str | None = None,
+    promote_source: bool = True,
 ) -> tuple[str | None, bool, str | None]:
     """Find or create a project in `state_5.sqlite`. Returns `(project_id, created, warning)`."""
     if not db_path.is_file():
@@ -422,9 +457,17 @@ def _ensure_sqlite_project(
                     "UPDATE threads SET project_id = ? WHERE id = ?",
                     (matched_pid, session_id),
                 )
-            # Codex Desktop's default interactive `thread/list` hides `source='exec'` threads.
-            # Promote this AGY-delegated thread to interactive `vscode` so it appears in Codex Desktop.
-            if {"id", "source"}.issubset(thread_cols):
+            # Codex Desktop's default interactive `thread/list` hides `source='exec'` threads
+            # and reconciles `threads.source` from line 1 of `rollout_path`. Promote both
+            # atomically once Codex CLI has closed the rollout so AGY threads appear in Codex Desktop.
+            if promote_source and {"id", "source"}.issubset(thread_cols):
+                if "rollout_path" in thread_cols:
+                    rp_row = cur.execute(
+                        "SELECT rollout_path FROM threads WHERE id = ? AND source = 'exec'",
+                        (session_id,),
+                    ).fetchone()
+                    if rp_row and isinstance(rp_row[0], str):
+                        _promote_rollout_source_to_interactive(rp_row[0])
                 cur.execute(
                     "UPDATE threads SET source = 'vscode' WHERE id = ? AND source = 'exec'",
                     (session_id,),
@@ -789,6 +832,7 @@ def ensure_codex_project_and_bind(
     codex_home: Path | None = None,
     allow_create: bool = True,
     use_rpc: bool | None = None,
+    promote_source: bool = True,
 ) -> dict[str, Any]:
     """Ensure `workspace_dir` exists as a Codex Desktop project and bind `session_id` to it.
 
@@ -838,6 +882,7 @@ def ensure_codex_project_and_bind(
         session_id,
         allow_create=allow_create,
         preferred_id=rpc_pid,
+        promote_source=promote_source,
     )
     if sq_warn:
         warnings.append(sq_warn)

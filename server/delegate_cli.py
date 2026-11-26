@@ -501,6 +501,7 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                     codex_bin=codex_bin,
                     allow_create=True,
                     use_rpc=not args.codex_bin,
+                    promote_source=False,
                 )
                 with early_sync_lock:
                     early_title_info = t_info
@@ -670,14 +671,16 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 codex_bin=codex_bin,
                 use_rpc=not args.codex_bin,
             )
-        if not (codex_project_info and codex_project_info.get("bound")):
-            codex_project_info = ensure_codex_project_and_bind(
-                workspace_dir,
-                bound_sid,
-                codex_bin=codex_bin,
-                allow_create=True,
-                use_rpc=not args.codex_bin,
-            )
+        # Always run idempotent final sync after Codex exits so the closed rollout's
+        # `session_meta.source` is promoted safely for Codex Desktop visibility.
+        codex_project_info = ensure_codex_project_and_bind(
+            workspace_dir,
+            bound_sid,
+            codex_bin=codex_bin,
+            allow_create=True,
+            use_rpc=not args.codex_bin,
+            promote_source=True,
+        )
 
     changed_files_set: set[str] = set(state["changed_files"])
     if isolation_mode != "read-only":
