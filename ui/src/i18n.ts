@@ -7,9 +7,10 @@ import type {
 } from "./types";
 
 export function resolveLocale(setting: UiLocale, hostLocale?: string | null): ResolvedLocale {
-  if (setting === "zh" || setting === "en") return setting;
+  if (setting === "zh" || setting === "en" || setting === "ja") return setting;
   const raw = (hostLocale || navigator.language || "en").toLowerCase();
   if (raw.startsWith("zh")) return "zh";
+  if (raw.startsWith("ja")) return "ja";
   return "en";
 }
 
@@ -20,6 +21,11 @@ export function formatCompactNumber(n: number, locale: ResolvedLocale): string {
     if (n >= 1e4) return `${(n / 1e4).toFixed(1)}万`;
     return n.toLocaleString("zh-CN");
   }
+  if (locale === "ja") {
+    if (n >= 1e8) return `${(n / 1e8).toFixed(1)}億`;
+    if (n >= 1e4) return `${(n / 1e4).toFixed(1)}万`;
+    return n.toLocaleString("ja-JP");
+  }
   if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
@@ -28,11 +34,12 @@ export function formatCompactNumber(n: number, locale: ResolvedLocale): string {
 
 export function formatDays(days: number, locale: ResolvedLocale): string {
   if (locale === "zh") return `${days} 天`;
+  if (locale === "ja") return `${days}日`;
   return days === 1 ? "1 day" : `${days} days`;
 }
 
 export function monthLabel(monthZeroBased: number, locale: ResolvedLocale): string {
-  if (locale === "zh") return `${monthZeroBased + 1}月`;
+  if (locale === "zh" || locale === "ja") return `${monthZeroBased + 1}月`;
   const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   return names[monthZeroBased] ?? "";
 }
@@ -340,8 +347,111 @@ const EN: Strings = {
   summaryAborted: "Aborted / Error",
 };
 
+const JA: Strings = {
+  overview: "概要",
+  searchPlaceholder: "セッション・プロジェクト・モデルを検索…",
+  refreshSessions: "セッション一覧を更新",
+  toggleSidebar: "サイドバーを切替",
+  noSessionsDir: "Codex セッションディレクトリが見つかりません",
+  noMatchingSessions: "一致するセッションはありません",
+  noLocalSessions: "ローカルの Codex セッションがありません",
+  connecting: "接続中",
+  liveSync: "リアルタイム",
+  syncError: "同期エラー",
+  autoFollow: "自動追従",
+  loadingSession: "読み込み中…",
+  emptySessionTurns: "このセッションには実行履歴がありません",
+  roundsLabel: "ラウンド",
+  commandsLabel: "コマンド",
+  changedFilesLabel: "変更ファイル",
+  durationLabel: "所要時間",
+  thinkingSummary: (n) => `思考メモ · ${n}`,
+  commandExecutions: "コマンド実行",
+  expandAllCommands: "すべて表示",
+  collapseCommands: "折りたたむ",
+  liveBannerCta: "進捗を見る",
+  noOutput: "(出力なし)",
+  abortedPrefix: "中断: ",
+  cancelTask: "タスク停止",
+  cancelling: "停止中…",
+  attachSummary: "要約を添付",
+  attachSummaryTip: "次のメッセージに簡潔な要約を添付",
+  sendSummary: "チャットに送信",
+  sendSummaryTip: "現在のチャットに簡潔な要約を送信",
+  handoffRound: "この回を送信",
+  handoffRoundTip: "このラウンドの要約をチャットへ連携",
+  toastCancelled: "タスクを停止しました",
+  toastAlreadyDone: "タスクは既に終了しています",
+  toastCancelFailed: (e) => `停止に失敗: ${e}`,
+  toastAttached: "チャットに添付しました",
+  toastAttachFailed: (e) => `添付に失敗: ${e}`,
+  toastSent: "チャットに送信しました",
+  toastHostRejected: "ホストにより送信が拒否されました",
+  toastSendFailed: (e) => `送信に失敗: ${e}`,
+  toastModeSwitched: (label) => `ポリシー変更: ${label}`,
+  toastSwitchFailed: (e) => `変更に失敗: ${e}`,
+  routingPolicyAria: "モデル切替ポリシー",
+  routingPolicyTip: "Codex モデル切替ポリシー",
+  languageAria: "表示言語",
+  languageAuto: "自動",
+  openFileTip: (p) => `サイドペインで ${p} を開く`,
+  delegatedByTip: (src) => `${src} から依頼`,
+  roundTag: (n, delegated) => (delegated ? `第 ${n} 回・依頼` : `第 ${n} 回`),
+  roundsShort: (n) => `${n}回`,
+  quota5hTip: (rem, reset) => `Codex 5h 残り ${rem}%（リセット: ${reset}）`,
+  quota7dTip: (rem, reset) => `Codex 7d 残り ${rem}%（リセット: ${reset}）`,
+  quotaResetCreditsTip: (n) => `利用可能なリセットクレジット: ${n}`,
+  antigravityQuotaNote: "Antigravity には公開のローカル残量 API がないため、クライアントのアカウント画面をご確認ください。",
+  allProjects: "すべてのプロジェクト",
+  kpiTotalTokens: "累計トークン",
+  kpiAgyShare: "AGY 依頼比率",
+  kpiLongestTask: "最長実行時間",
+  kpiLongestStreak: "最長連続日数",
+  kpiCurrentStreak: "現在の連続日数",
+  heatmapTitle: "アクティビティ",
+  originAll: "すべて",
+  originAgy: "AGY 依頼",
+  originDirect: "直接実行",
+  metricTokens: "トークン",
+  metricSessions: "セッション数",
+  heatmapLess: "少",
+  heatmapMore: "多",
+  heatmapAgyDotHint: "AGY 依頼あり",
+  heatmapTooltip: (d, tot, agy, dir, tok) =>
+    `${d} · ${tot} 件（AGY 依頼 ${agy} / 直接実行 ${dir}）· ${tok} トークン`,
+  heatmapEmptyDay: (d) => `${d} · アクティビティなし`,
+  originSplitSummary: (agy, agyPct, dir, dirPct) =>
+    `AGY 依頼 ${agy} (${agyPct}%) · 直接実行 ${dir} (${dirPct}%)`,
+  insightsTitle: "インサイト",
+  insightOrigin: "セッション内訳",
+  insightTopModel: "最も使用したモデル",
+  insightTopEffort: "最も使用した推論強度",
+  insightActiveProjects: "アクティブプロジェクト",
+  insightTotalCommands: "累計コマンド実行",
+  insightRoutingMode: "現在のポリシー",
+  recentSessionsTitle: "最近のセッション",
+  hotFilesTitle: "よく変更されるファイル",
+  touchedBySessions: (n) => `${n} 件のセッション`,
+  originTagAgy: "AGY 依頼",
+  originTagDirect: "直接実行",
+  clearDateFilter: "日付フィルタを解除",
+  noFilteredSessions: "条件に一致するセッションはありません",
+  summarySessionHeading: (t) => `### Codex Orbit セッション要約: ${t}`,
+  summaryRoundHeading: (r) => `### Codex Orbit 要約（第 ${r} 回）`,
+  summaryWorkspace: "ワークスペース",
+  summaryIsolation: "モード",
+  summaryStatus: "ステータス",
+  summaryStats: (c, f, d) => `コマンド ${c} 件、変更ファイル ${f} 件、所要時間 ${d}`,
+  summaryFiles: "変更ファイル",
+  summaryMoreFiles: (n) => `… 他 ${n} 件`,
+  summaryConclusion: "結論サマリー",
+  summaryAborted: "中断 / エラー",
+};
+
 export function getStrings(locale: ResolvedLocale): Strings {
-  return locale === "zh" ? ZH : EN;
+  if (locale === "zh") return ZH;
+  if (locale === "ja") return JA;
+  return EN;
 }
 
 export function statusLabel(status: SessionStatus, locale: ResolvedLocale): string {
@@ -355,6 +465,18 @@ export function statusLabel(status: SessionStatus, locale: ResolvedLocale): stri
         return "已中止";
       default:
         return "空闲";
+    }
+  }
+  if (locale === "ja") {
+    switch (status) {
+      case "running":
+        return "実行中";
+      case "completed":
+        return "完了";
+      case "aborted":
+        return "中断";
+      default:
+        return "待機";
     }
   }
   switch (status) {
@@ -381,6 +503,16 @@ export function isolationLabel(mode: IsolationMode | null | undefined, locale: R
         return "同目录";
     }
   }
+  if (locale === "ja") {
+    switch (mode) {
+      case "read-only":
+        return "読取専用";
+      case "worktree":
+        return "Worktree";
+      case "workspace-write":
+        return "同フォルダ";
+    }
+  }
   switch (mode) {
     case "read-only":
       return "Read-only";
@@ -402,6 +534,16 @@ export function routingModeLabel(mode: RoutingMode, locale: ResolvedLocale): str
         return "极致";
     }
   }
+  if (locale === "ja") {
+    switch (mode) {
+      case "silent_low_cost":
+        return "エコ";
+      case "ask":
+        return "バランス";
+      case "silent_best":
+        return "最高";
+    }
+  }
   switch (mode) {
     case "silent_low_cost":
       return "Eco";
@@ -415,6 +557,17 @@ export function routingModeLabel(mode: RoutingMode, locale: ResolvedLocale): str
 export function effortLabel(effort: string | null | undefined, locale: ResolvedLocale): string {
   if (!effort) return "-";
   if (locale === "en") return effort;
+  if (locale === "ja") {
+    const jaMap: Record<string, string> = {
+      low: "低 (low)",
+      medium: "中 (medium)",
+      high: "高 (high)",
+      xhigh: "超高 (xhigh)",
+      max: "最大 (max)",
+      ultra: "Ultra",
+    };
+    return jaMap[effort.toLowerCase()] ?? effort;
+  }
   const map: Record<string, string> = {
     low: "低 (low)",
     medium: "中 (medium)",
@@ -431,7 +584,11 @@ export function formatRelativeTime(iso: string | null | undefined, locale: Resol
   const ts = Date.parse(iso);
   if (Number.isNaN(ts)) return "";
   const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-  if (diffSec < 60) return locale === "zh" ? "刚刚" : "just now";
+  if (diffSec < 60) {
+    if (locale === "zh") return "刚刚";
+    if (locale === "ja") return "たった今";
+    return "just now";
+  }
   if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`;
   if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`;
   const d = new Date(ts);

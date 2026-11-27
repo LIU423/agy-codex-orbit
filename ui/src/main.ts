@@ -161,7 +161,7 @@ function findBestRunningSession(
 
 function applyLocaleToDocument(): void {
   const loc = activeLocale();
-  document.documentElement.lang = loc === "zh" ? "zh-CN" : "en";
+  document.documentElement.lang = loc === "zh" ? "zh-CN" : loc === "ja" ? "ja" : "en";
   document.documentElement.dataset.lang = loc;
   updateSidebarChrome();
 }
@@ -400,6 +400,7 @@ function renderLocaleSelect(): string {
     { value: "auto", label: str.languageAuto },
     { value: "zh", label: "中文" },
     { value: "en", label: "EN" },
+    { value: "ja", label: "日本語" },
   ];
   const optionsHtml = opts
     .map(

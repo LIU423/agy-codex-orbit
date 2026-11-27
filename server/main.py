@@ -317,7 +317,7 @@ def create_server(
     @mcp.tool(
         name="orbit_set_ui_locale",
         title="Set Codex Orbit UI language",
-        description="App-only tool: persist UI language preference (auto, zh, en).",
+        description="App-only tool: persist UI language preference (auto, zh, en, ja).",
         meta=APP_ONLY_META,
         structured_output=False,
     )

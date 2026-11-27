@@ -13,11 +13,11 @@ from server.delegation_store import resolve_data_dir
 
 RoutingMode = Literal["silent_low_cost", "ask", "silent_best"]
 TaskTier = Literal["light", "standard", "complex"]
-UiLocale = Literal["auto", "zh", "en"]
+UiLocale = Literal["auto", "zh", "en", "ja"]
 
 VALID_ROUTING_MODES: tuple[RoutingMode, ...] = ("silent_low_cost", "ask", "silent_best")
 VALID_TASK_TIERS: tuple[TaskTier, ...] = ("light", "standard", "complex")
-VALID_UI_LOCALES: tuple[UiLocale, ...] = ("auto", "zh", "en")
+VALID_UI_LOCALES: tuple[UiLocale, ...] = ("auto", "zh", "en", "ja")
 DEFAULT_ROUTING_MODE: RoutingMode = "ask"
 DEFAULT_UI_LOCALE: UiLocale = "auto"
 

@@ -19,7 +19,7 @@
   --bd-2: var(--color-border-secondary, #ebeff4);
   --ring: var(--color-ring-primary, #2563eb);
 
-  --font-ui: var(--font-sans, "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei UI", system-ui, -apple-system, sans-serif);
+  --font-ui: var(--font-sans, "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Hiragino Sans", "Yu Gothic UI", "Meiryo", system-ui, -apple-system, sans-serif);
   --font-mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
 
   --prose-size: 14px;
@@ -31,6 +31,13 @@ html[data-lang="en"] {
   --prose-size: 14px;
   --prose-lh: 1.62;
   --prose-ls: -0.004em;
+}
+
+html[data-lang="ja"] {
+  --font-ui: var(--font-sans, "Inter", "Segoe UI", "Hiragino Sans", "Yu Gothic UI", "Meiryo", system-ui, -apple-system, sans-serif);
+  --prose-size: 14px;
+  --prose-lh: 1.72;
+  --prose-ls: 0.015em;
 }
 
 * {

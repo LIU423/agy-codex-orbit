@@ -102,9 +102,11 @@ def test_mcp_app_metadata_and_zero_token_visibility(tmp_path: Path) -> None:
         assert mode_res.structured_content["routing_mode"] == "silent_low_cost"
         locale_res = await server.call_tool("orbit_set_ui_locale", {"ui_locale": "en"})
         assert locale_res.structured_content["ui_locale"] == "en"
+        locale_ja_res = await server.call_tool("orbit_set_ui_locale", {"ui_locale": "ja"})
+        assert locale_ja_res.structured_content["ui_locale"] == "ja"
         list_after = await server.call_tool("orbit_list_sessions", {})
         assert list_after.structured_content["routing_mode"] == "silent_low_cost"
-        assert list_after.structured_content["ui_locale"] == "en"
+        assert list_after.structured_content["ui_locale"] == "ja"
         ov_res = await server.call_tool("orbit_get_overview", {})
         assert ov_res.structured_content["kpis"]["total_sessions"] == 1
 

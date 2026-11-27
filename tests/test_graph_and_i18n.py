@@ -22,6 +22,8 @@ def test_ui_locale_persistence(tmp_path: Path) -> None:
     assert load_ui_locale(data_dir) == "en"
     assert save_ui_locale("zh", data_dir) == "zh"
     assert load_ui_locale(data_dir) == "zh"
+    assert save_ui_locale("ja", data_dir) == "ja"
+    assert load_ui_locale(data_dir) == "ja"
     with pytest.raises(ValueError):
         save_ui_locale("fr", data_dir)
 

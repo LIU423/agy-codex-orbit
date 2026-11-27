@@ -1,8 +1,8 @@
 export type SessionStatus = "running" | "completed" | "aborted" | "idle";
 export type IsolationMode = "read-only" | "worktree" | "workspace-write";
 export type RoutingMode = "silent_low_cost" | "ask" | "silent_best";
-export type UiLocale = "auto" | "zh" | "en";
-export type ResolvedLocale = "zh" | "en";
+export type UiLocale = "auto" | "zh" | "en" | "ja";
+export type ResolvedLocale = "zh" | "en" | "ja";
 export type OriginFilter = "all" | "agy" | "direct";
 export type HeatmapMetric = "tokens" | "sessions";
 
