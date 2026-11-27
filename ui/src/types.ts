@@ -1,6 +1,8 @@
 export type SessionStatus = "running" | "completed" | "aborted" | "idle";
 export type IsolationMode = "read-only" | "worktree" | "workspace-write";
 export type RoutingMode = "silent_low_cost" | "ask" | "silent_best";
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export type ReasoningEffortSetting = "auto" | ReasoningEffort;
 export type UiLocale = "auto" | "zh-CN" | "zh-TW" | "en" | "ja";
 export type ResolvedLocale = "zh-CN" | "zh-TW" | "en" | "ja";
 export type OriginFilter = "all" | "agy" | "direct";
@@ -62,6 +64,7 @@ export interface TurnDetail {
   command_count: number;
   changed_file_count: number;
   error_reason?: string | null;
+  error_code?: string | null;
   token_usage?: TokenUsageSummary | null;
 }
 
@@ -119,8 +122,15 @@ export interface SessionDelta {
   all_changed_files: FileChangeRecord[];
 }
 
+export interface ProjectEntry {
+  project_dir: string;
+  project_name: string;
+  created_at?: string;
+}
+
 export interface ListSessionsResponse {
   sessions: SessionSummary[];
+  projects?: ProjectEntry[];
   sessions_dir: string;
   sessions_dir_exists: boolean;
   routing_mode?: RoutingMode;
@@ -129,6 +139,7 @@ export interface ListSessionsResponse {
   escalation_model?: string;
   quota_guardrail_enabled?: boolean;
   quota_guardrail_threshold_pct?: number;
+  reasoning_effort?: ReasoningEffortSetting;
 }
 
 export interface ModelCatalogEntry {
@@ -146,7 +157,19 @@ export interface OrbitSettingsResponse {
   escalation_model: string;
   quota_guardrail_enabled: boolean;
   quota_guardrail_threshold_pct: number;
+  reasoning_effort: ReasoningEffortSetting;
   available_models: ModelCatalogEntry[];
+}
+
+export interface OrbitBootstrapResponse {
+  sessions: SessionSummary[];
+  projects?: ProjectEntry[];
+  sessions_dir: string;
+  sessions_dir_exists: boolean;
+  settings: OrbitSettingsResponse;
+  quota: QuotaStatus | null;
+  quota_stale: boolean;
+  overview: ProfileOverviewResponse | null;
 }
 
 export interface DoctorCheckItem {
@@ -168,6 +191,29 @@ export interface PruneWorktreesResult {
   removed: string[];
   skipped_running: string[];
   errors: string[];
+}
+
+export interface SendFollowupResult {
+  started: boolean;
+  session_id?: string;
+  run_id?: string;
+  busy?: boolean;
+  error?: string;
+}
+
+export interface CreateProjectResult {
+  created: boolean;
+  project_dir?: string;
+  project_name?: string;
+  error?: string;
+}
+
+export interface CreateSessionResult {
+  started: boolean;
+  run_id?: string;
+  workspace_dir?: string;
+  title?: string;
+  error?: string;
 }
 
 export interface OpenOrbitBootstrap {

@@ -70,6 +70,7 @@ class DelegationRoundRecord(BaseModel):
     changed_files: list[str] = Field(default_factory=list)
     final_message: str = ""
     error_summary: str | None = None
+    error_code: str | None = None
 
 
 class DelegationSessionRecord(BaseModel):
@@ -106,6 +107,7 @@ class TurnDetail(BaseModel):
     command_count: int = 0
     changed_file_count: int = 0
     error_reason: str | None = None
+    error_code: str | None = None
     token_usage: TokenUsageSummary | None = None
 
 

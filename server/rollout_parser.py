@@ -100,9 +100,11 @@ def _extract_uuid_from_path(path: Path) -> str:
 def _normalize_project_dir(cwd: str | None) -> tuple[str, str]:
     if not cwd or not cwd.strip():
         return "(Unknown Workspace)", "Unknown Workspace"
-    cleaned = cwd.strip().rstrip("\\/")
-    if not cleaned:
-        return cwd.strip(), cwd.strip()
+    cleaned = cwd.strip()
+    _, tail = os.path.splitdrive(cleaned)
+    if not tail.strip("\\/"):
+        return cleaned, cleaned
+    cleaned = cleaned.rstrip("\\/")
     name = os.path.basename(cleaned) or cleaned
     return cleaned, name
 
@@ -146,6 +148,18 @@ def _extract_content_text(content: Any) -> str:
         elif isinstance(item, str) and item:
             parts.append(item)
     return "\n".join(parts).strip()
+
+
+def _extract_effort(pl: dict[str, Any]) -> str | None:
+    collaboration_mode = pl.get("collaboration_mode")
+    settings = collaboration_mode.get("settings") if isinstance(collaboration_mode, dict) else None
+    candidates = [pl.get("effort"), pl.get("reasoning_effort")]
+    if isinstance(settings, dict):
+        candidates.extend((settings.get("reasoning_effort"), settings.get("effort")))
+    for value in candidates:
+        if isinstance(value, str) and (effort := value.strip()):
+            return effort
+    return None
 
 
 def _duration_ms_from_obj(duration: Any, started_ms: Any = None, completed_ms: Any = None) -> int | None:
@@ -289,6 +303,7 @@ class RolloutParseState:
                 round_index=len(self.turn_order) + 1,
                 turn_id=turn_id,
                 model=self.model,
+                effort=self.reasoning_effort,
                 started_at=timestamp,
             )
             self.turns_by_id[turn_id] = turn
@@ -450,15 +465,15 @@ class RolloutParseState:
         model = pl.get("model")
         if isinstance(model, str) and model:
             self.model = model
-        effort = pl.get("effort")
-        if isinstance(effort, str) and effort:
+        effort = _extract_effort(pl)
+        if effort:
             self.reasoning_effort = effort
         turn_id = pl.get("turn_id") if isinstance(pl.get("turn_id"), str) else None
         if turn_id:
             turn = self._get_or_create_turn(turn_id, timestamp=timestamp)
             if isinstance(model, str) and model:
                 turn.model = model
-            if isinstance(effort, str) and effort:
+            if effort:
                 turn.effort = effort
             turn.dirty = True
 
@@ -475,6 +490,14 @@ class RolloutParseState:
                     self.reasoning_effort = settings["reasoning_effort"]
                 if isinstance(settings.get("cwd"), str) and settings["cwd"] and not self.cwd:
                     self.cwd = settings["cwd"]
+                active_turn = self.turns_by_id.get(self.active_turn_id) if self.active_turn_id is not None else None
+                if active_turn is not None:
+                    if self.model and not active_turn.model:
+                        active_turn.model = self.model
+                        active_turn.dirty = True
+                    if self.reasoning_effort and not active_turn.effort:
+                        active_turn.effort = self.reasoning_effort
+                        active_turn.dirty = True
             return
 
         if ev_type == "task_started":
@@ -485,6 +508,8 @@ class RolloutParseState:
                 turn.started_at = started_iso
             if self.model and not turn.model:
                 turn.model = self.model
+            if self.reasoning_effort and not turn.effort:
+                turn.effort = self.reasoning_effort
             turn.dirty = True
             return
 
@@ -782,8 +807,10 @@ class RolloutParseState:
         *,
         indexed_title: str | None = None,
         now_ts: float | None = None,
+        turns: list[TurnDetail] | None = None,
     ) -> SessionSummary:
-        turns = self.build_turns(now_ts=now_ts)
+        if turns is None:
+            turns = self.build_turns(now_ts=now_ts)
         project_dir, project_name = _normalize_project_dir(self.cwd)
 
         status: SessionStatus = "idle"
@@ -808,6 +835,7 @@ class RolloutParseState:
             title = f"Session {self.session_id[:8]}"
 
         latest_duration = turns[-1].duration_ms if turns else None
+        latest_effort = next((t.effort for t in reversed(turns) if t.effort), None)
         total_duration = sum(t.duration_ms for t in turns if t.duration_ms) or latest_duration
         updated_at = self.last_event_at or _mtime_ns_to_iso(self.file_mtime_ns)
         inferred_delegated = title.lower().startswith("agy:")
@@ -819,7 +847,7 @@ class RolloutParseState:
             project_name=project_name,
             git_branch=self.git_branch,
             model=self.model or (turns[-1].model if turns else None),
-            reasoning_effort=self.reasoning_effort or (turns[-1].effort if turns else None),
+            reasoning_effort=latest_effort or self.reasoning_effort,
             originator=self.originator,
             status=status,
             round_count=len(turns),
@@ -841,7 +869,7 @@ class RolloutParseState:
         now_ts: float | None = None,
     ) -> SessionDetail:
         turns = self.build_turns(now_ts=now_ts)
-        summary = self.build_summary(indexed_title=indexed_title, now_ts=now_ts)
+        summary = self.build_summary(indexed_title=indexed_title, turns=turns)
         unique_files: dict[str, FileChangeRecord] = {}
         for t in turns:
             for fc in t.changed_files:

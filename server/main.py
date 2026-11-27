@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -21,21 +22,32 @@ if str(_REPO_ROOT) not in sys.path:
 
 from mcp import types
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
-from server.codex_desktop import query_codex_quota, read_codex_model_catalog
+from server.codex_desktop import (
+    query_codex_quota,
+    read_cached_codex_quota,
+    read_codex_model_catalog,
+    read_rollout_fallback_quota_status,
+)
 from server.delegation_store import (
     DelegationStore,
     _atomic_write_json,
     prune_idle_worktrees,
     resolve_data_dir,
     runtime_pointer_path,
+    utc_now_iso,
 )
 from server.doctor import run_doctor
+from server.models import IsolationMode
 from server.overview_builder import build_profile_overview
 from server.process_control import cancel_delegation
 from server.routing_policy import (
+    DEFAULT_REASONING_EFFORT,
     ROUTING_MODE_LABELS,
+    VALID_REASONING_EFFORT_SETTINGS,
     OrbitSettings,
+    _normalize_reasoning_effort,
     load_settings,
     save_routing_mode,
     save_settings,
@@ -45,6 +57,7 @@ from server.session_store import SessionStore
 
 APP_URI = "ui://codex-orbit/app.html"
 APP_MIME = "text/html;profile=mcp-app"
+QUOTA_MAX_AGE_SECONDS = 60.0
 
 PANE_META: dict[str, Any] = {
     "ui": {"resourceUri": APP_URI},
@@ -96,10 +109,39 @@ def _write_runtime_pointer(data_dir: Path | None) -> None:
         pass
 
 
-def _reap_followup(process: subprocess.Popen, prompt_path: Path) -> None:
+def _reap_delegation(process: subprocess.Popen, prompt_path: Path) -> None:
     process.wait()
     with suppress(OSError):
         prompt_path.unlink(missing_ok=True)
+
+
+def _read_projects(path: Path) -> list[dict[str, str]]:
+    """Read the saved project entries, keeping invalid files intact for recovery."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    projects = payload.get("projects") if isinstance(payload, dict) else None
+    if not isinstance(projects, list) or any(
+        not isinstance(project, dict) or not all(
+            isinstance(project.get(key), str) for key in ("project_dir", "project_name", "created_at")
+        )
+        for project in projects
+    ):
+        raise ValueError("Invalid projects.json format.")
+    return projects
+
+
+def _resolve_workspace_dir(workspace_dir: str, *, create_if_missing: bool = False) -> Path:
+    """Expand and resolve a workspace path, optionally creating its directory."""
+    if not workspace_dir.strip():
+        raise ValueError("Workspace directory is required.")
+    resolved = Path(workspace_dir.strip()).expanduser().resolve()
+    if create_if_missing and not resolved.exists():
+        resolved.mkdir(parents=True, exist_ok=True)
+    if not resolved.is_dir():
+        raise ValueError(f"Workspace path is not an existing directory: {resolved}")
+    return resolved
 
 
 def create_server(
@@ -109,6 +151,7 @@ def create_server(
     html_path: Path | None = None,
     data_dir: Path | None = None,
     write_pointer: bool = False,
+    warmup: bool = False,
 ) -> MCPServer:
     resolved_data_dir = resolve_data_dir(data_dir)
     if write_pointer:
@@ -122,10 +165,64 @@ def create_server(
     )
     mcp = MCPServer(
         name="Codex Orbit",
-        version="0.7.0",
+        version="0.1.0",
     )
     quota_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+    quota_refresh_lock = threading.Lock()
+    quota_refresh_in_flight = False
     followup_lock = threading.Lock()
+    projects_path = resolved_data_dir / "projects.json"
+    projects_lock = threading.Lock()
+
+    def _query_live_quota() -> dict[str, Any]:
+        data = query_codex_quota(
+            codex_home=store.sessions_dir.parent,
+            data_dir=resolved_data_dir,
+            use_cache=False,
+        )
+        with quota_refresh_lock:
+            quota_cache.update(ts=time.monotonic(), data=data)
+        return data
+
+    def _trigger_quota_refresh_async() -> None:
+        def refresh() -> None:
+            nonlocal quota_refresh_in_flight
+            try:
+                _query_live_quota()
+            finally:
+                with quota_refresh_lock:
+                    quota_refresh_in_flight = False
+
+        nonlocal quota_refresh_in_flight
+        with quota_refresh_lock:
+            if quota_refresh_in_flight or (
+                quota_cache["data"] is not None and time.monotonic() - quota_cache["ts"] < QUOTA_MAX_AGE_SECONDS
+            ):
+                return
+            quota_refresh_in_flight = True
+            try:
+                threading.Thread(target=refresh, daemon=True).start()
+            except RuntimeError:
+                quota_refresh_in_flight = False
+
+    def _read_quota_without_live_query() -> tuple[dict[str, Any] | None, bool]:
+        with quota_refresh_lock:
+            memory_data = quota_cache["data"]
+            memory_recent = time.monotonic() - quota_cache["ts"] < QUOTA_MAX_AGE_SECONDS
+        memory_codex = memory_data.get("codex", {}) if memory_data is not None else {}
+        memory_available = memory_codex.get("available") is True
+        # A live query can itself fall back to historical rollout data.
+        if memory_available and memory_recent and memory_codex.get("source") != "rollout_cache":
+            return memory_data, True
+        disk_cache = read_cached_codex_quota(data_dir=resolved_data_dir, allow_stale=True)
+        if disk_cache is not None and disk_cache[1]:
+            return disk_cache
+        if memory_available:
+            return memory_data, False
+        if disk_cache is not None:
+            return disk_cache
+        fallback = read_rollout_fallback_quota_status(store.sessions_dir.parent)
+        return (fallback if fallback is not None else memory_data), False
 
     @mcp.resource(
         APP_URI,
@@ -163,11 +260,19 @@ def create_server(
         workspace_dir: str | None = None,
     ) -> types.CallToolResult:
         resolved_session_id = session_id
+        norm_target = os.path.normcase(os.path.normpath(workspace_dir)) if workspace_dir else None
+        if resolved_session_id is None and focus_running:
+            for delegation in delegation_store.load_all(verify_liveness=True):
+                if delegation.rounds and delegation.rounds[-1].status == "running" and (
+                    norm_target is None
+                    or os.path.normcase(os.path.normpath(delegation.workspace_dir)) == norm_target
+                ):
+                    resolved_session_id = delegation.session_id or delegation.record_id
+                    break
         if resolved_session_id is None and focus_running:
             sessions = store.list_sessions(limit=50)
             running = [s for s in sessions if s.status == "running"]
-            if workspace_dir:
-                norm_target = os.path.normcase(os.path.normpath(workspace_dir))
+            if norm_target is not None:
                 matched = [
                     s
                     for s in running
@@ -192,6 +297,25 @@ def create_server(
             structured_content=bootstrap,
         )
 
+    def _session_list_payload(query: str, limit: int) -> dict[str, Any]:
+        clamped_limit = max(1, min(limit, 200))
+        sessions = store.list_sessions(query=query, limit=clamped_limit)
+        projects = []
+        with suppress(OSError, ValueError):
+            projects = _read_projects(projects_path)
+        q = query.strip().casefold()
+        if q:
+            projects = [
+                project for project in projects
+                if q in project["project_dir"].casefold() or q in project["project_name"].casefold()
+            ]
+        return {
+            "sessions": [s.model_dump(mode="json") for s in sessions],
+            "projects": projects,
+            "sessions_dir": str(store.sessions_dir),
+            "sessions_dir_exists": store.sessions_dir.exists() or len(sessions) > 0,
+        }
+
     @mcp.tool(
         name="orbit_list_sessions",
         title="List Codex sessions",
@@ -200,17 +324,43 @@ def create_server(
         structured_output=False,
     )
     def orbit_list_sessions(query: str = "", limit: int = 80) -> types.CallToolResult:
-        clamped_limit = max(1, min(limit, 200))
-        sessions = store.list_sessions(query=query, limit=clamped_limit)
-        payload = {
-            "sessions": [s.model_dump(mode="json") for s in sessions],
-            "sessions_dir": str(store.sessions_dir),
-            "sessions_dir_exists": store.sessions_dir.exists() or len(sessions) > 0,
-            **load_settings(resolved_data_dir).to_dict(),
-        }
+        payload = {**_session_list_payload(query, limit), **load_settings(resolved_data_dir).to_dict()}
         return types.CallToolResult(
-            content=[types.TextContent(type="text", text=f"{len(sessions)} sessions")],
+            content=[types.TextContent(type="text", text=f"{len(payload['sessions'])} sessions")],
             structured_content=payload,
+        )
+
+    @mcp.tool(
+        name="orbit_create_project",
+        title="Create Orbit project",
+        meta=APP_ONLY_META,
+        structured_output=False,
+    )
+    def orbit_create_project(workspace_dir: str, create_if_missing: bool = False) -> types.CallToolResult:
+        """Add a workspace directory to Orbit's project list."""
+        try:
+            resolved = _resolve_workspace_dir(workspace_dir, create_if_missing=create_if_missing)
+            project_dir = str(resolved)
+            project_name = resolved.name or project_dir
+            project_key = os.path.normcase(os.path.normpath(project_dir))
+            with projects_lock:
+                projects = _read_projects(projects_path)
+                if not any(os.path.normcase(os.path.normpath(p["project_dir"])) == project_key for p in projects):
+                    projects.append({
+                        "project_dir": project_dir,
+                        "project_name": project_name,
+                        "created_at": utc_now_iso(),
+                    })
+                    _atomic_write_json(projects_path, {"projects": projects})
+        except (OSError, RuntimeError, ValueError) as exc:
+            error = str(exc)
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=error)],
+                structured_content={"created": False, "error": error},
+            )
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text="Project added.")],
+            structured_content={"created": True, "project_dir": project_dir, "project_name": project_name},
         )
 
     @mcp.tool(
@@ -259,13 +409,146 @@ def create_server(
             structured_content=payload,
         )
 
-    def followup_error(error: str, *, busy: bool = False) -> types.CallToolResult:
+    def launch_error(error: str, *, busy: bool = False) -> types.CallToolResult:
         payload = {"started": False, "error": error}
         if busy:
             payload["busy"] = True
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=error)],
             structured_content=payload,
+        )
+
+    def launch_delegation(
+        *,
+        workspace_dir: Path,
+        prompt: str,
+        isolation_mode: IsolationMode,
+        title: str,
+        web_search: bool,
+        session_id: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> types.CallToolResult:
+        """Reserve a round before starting its detached CLI wrapper."""
+        normalized = (
+            DEFAULT_REASONING_EFFORT if reasoning_effort is None else _normalize_reasoning_effort(reasoning_effort)
+        )
+        if normalized is None:
+            return launch_error(
+                f"Invalid reasoning_effort {reasoning_effort!r}. "
+                f"Choose from {', '.join(VALID_REASONING_EFFORT_SETTINGS)}."
+            )
+        explicit_effort = normalized if normalized != DEFAULT_REASONING_EFFORT else None
+        initial_effort = explicit_effort
+        if initial_effort is None:
+            saved_effort = load_settings(resolved_data_dir).reasoning_effort
+            if saved_effort != DEFAULT_REASONING_EFFORT:
+                initial_effort = saved_effort
+
+        run_id = f"run-{uuid.uuid4().hex[:10]}"
+        prompt_path = None
+        round_created = False
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", prefix="codex-orbit-", suffix=".prompt", delete=False,
+            ) as prompt_file:
+                prompt_path = Path(prompt_file.name)
+                prompt_file.write(prompt)
+
+            delegation_store.start_round(
+                run_id=run_id,
+                session_id=session_id,
+                workspace_dir=str(workspace_dir),
+                prompt=prompt,
+                isolation_mode=isolation_mode,
+                source_model="Orbit",
+                title=title,
+                reasoning_effort=initial_effort,
+            )
+            round_created = True
+            command = [
+                sys.executable, "-u", str(_REPO_ROOT / "server" / "delegate_cli.py"),
+                "--cwd", str(workspace_dir), "--mode", isolation_mode, "--data-dir", str(resolved_data_dir),
+                "--source-model", "Orbit", "--run-id", run_id,
+                "--prompt-file", str(prompt_path), "--delete-prompt-file",
+            ]
+            if session_id:
+                command.extend(["--session-id", session_id, "--no-desktop-project-sync"])
+            elif title.startswith("-"):
+                command.append(f"--title={title}")
+            else:
+                command.extend(["--title", title])
+            if web_search:
+                command.append("--web-search")
+            if explicit_effort is not None:
+                command.extend(["--reasoning-effort", explicit_effort])
+
+            creationflags = 0
+            if sys.platform == "win32":
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+                start_new_session=sys.platform != "win32",
+            )
+        except (OSError, ValueError) as exc:
+            operation = "follow-up" if session_id else "session"
+            error = f"Could not start {operation}: {exc}"
+            if prompt_path is not None:
+                with suppress(OSError):
+                    prompt_path.unlink(missing_ok=True)
+            if round_created:
+                with suppress(OSError):
+                    delegation_store.update_round(run_id, status="failed", error_summary=error, ended=True)
+            return launch_error(error)
+
+        threading.Thread(target=_reap_delegation, args=(process, prompt_path), daemon=True).start()
+        payload: dict[str, Any] = {"started": True, "run_id": run_id}
+        if session_id:
+            payload["session_id"] = session_id
+            message = "Follow-up started."
+        else:
+            payload.update(workspace_dir=str(workspace_dir), title=title)
+            message = "Session started."
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=message)],
+            structured_content=payload,
+        )
+
+    @mcp.tool(
+        name="orbit_create_session",
+        title="Create Codex session",
+        meta=APP_ONLY_META,
+        structured_output=False,
+    )
+    def orbit_create_session(
+        workspace_dir: str,
+        prompt: str,
+        title: str = "",
+        mode: str = "workspace-write",
+        web_search: bool = False,
+        reasoning_effort: str | None = None,
+    ) -> types.CallToolResult:
+        """Start a new conversation from its workspace and initial prompt."""
+        stripped_prompt = prompt.strip()
+        if not stripped_prompt:
+            return launch_error("Prompt is required.")
+        if mode not in ("workspace-write", "read-only", "worktree"):
+            return launch_error("Mode must be workspace-write, read-only, or worktree.")
+        try:
+            resolved = _resolve_workspace_dir(workspace_dir)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return launch_error(str(exc))
+        effective_title = title.strip() or stripped_prompt.splitlines()[0][:60].rstrip()
+        return launch_delegation(
+            workspace_dir=resolved,
+            prompt=prompt,
+            isolation_mode=mode,
+            title=effective_title,
+            web_search=web_search,
+            reasoning_effort=reasoning_effort,
         )
 
     @mcp.tool(
@@ -278,26 +561,27 @@ def create_server(
         session_id: str,
         prompt: str,
         web_search: bool = False,
+        reasoning_effort: str | None = None,
     ) -> types.CallToolResult:
         session_id = session_id.strip()
         prompt = prompt.strip()
         if not session_id:
-            return followup_error("Session ID is required.")
+            return launch_error("Session ID is required.")
         if not prompt:
-            return followup_error("Prompt is required.")
+            return launch_error("Prompt is required.")
 
         with followup_lock:
             detail, _ = store.get_session_detail(session_id)
             if detail is None or detail.summary.session_id != session_id:
-                return followup_error("Session not found.")
+                return launch_error("Session not found.")
 
             existing = delegation_store.get_by_session_id(session_id)
             if detail.summary.status == "running" or (
                 existing and any(round_rec.status == "running" for round_rec in existing.rounds)
             ):
-                return followup_error("Session already has a running task.", busy=True)
+                return launch_error("Session already has a running task.", busy=True)
             if existing and existing.session_id is None:
-                return followup_error("Session not found.")
+                return launch_error("Session not found.")
 
             workspace_dir = None
             for raw_path in (detail.summary.project_dir, existing.workspace_dir if existing else None):
@@ -311,60 +595,18 @@ def create_server(
                         workspace_dir = candidate.resolve()
                         break
             if workspace_dir is None:
-                return followup_error("Session workspace directory does not exist.")
+                return launch_error("Session workspace directory does not exist.")
 
             isolation_mode = (existing.isolation_mode if existing else detail.summary.isolation_mode) or "workspace-write"
-            run_id = f"run-{uuid.uuid4().hex[:10]}"
-            prompt_path = None
-            round_created = False
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", encoding="utf-8", prefix="codex-orbit-", suffix=".prompt", delete=False,
-                ) as prompt_file:
-                    prompt_path = Path(prompt_file.name)
-                    prompt_file.write(prompt)
-
-                delegation_store.start_round(
-                    run_id=run_id,
-                    session_id=session_id,
-                    workspace_dir=str(workspace_dir),
-                    prompt=prompt,
-                    isolation_mode=isolation_mode,
-                    source_model="Orbit",
-                    title=detail.summary.title,
-                )
-                round_created = True
-                command = [
-                    sys.executable, "-u", str(_REPO_ROOT / "server" / "delegate_cli.py"),
-                    "--session-id", session_id, "--cwd", str(workspace_dir),
-                    "--mode", isolation_mode, "--data-dir", str(resolved_data_dir),
-                    "--source-model", "Orbit", "--run-id", run_id,
-                    "--prompt-file", str(prompt_path), "--delete-prompt-file", "--no-desktop-project-sync",
-                ]
-                if web_search:
-                    command.append("--web-search")
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
-                    start_new_session=sys.platform != "win32",
-                )
-            except (OSError, UnicodeError) as exc:
-                error = f"Could not start follow-up: {exc}"
-                if prompt_path is not None:
-                    with suppress(OSError):
-                        prompt_path.unlink(missing_ok=True)
-                if round_created:
-                    delegation_store.update_round(run_id, status="failed", error_summary=error, ended=True)
-                return followup_error(error)
-
-            threading.Thread(target=_reap_followup, args=(process, prompt_path), daemon=True).start()
-        return types.CallToolResult(
-            content=[types.TextContent(type="text", text="Follow-up started.")],
-            structured_content={"started": True, "session_id": session_id, "run_id": run_id},
-        )
+            return launch_delegation(
+                workspace_dir=workspace_dir,
+                prompt=prompt,
+                isolation_mode=isolation_mode,
+                title=detail.summary.title,
+                web_search=web_search,
+                session_id=session_id,
+                reasoning_effort=reasoning_effort,
+            )
 
     @mcp.tool(
         name="orbit_cancel_delegation",
@@ -403,13 +645,14 @@ def create_server(
         structured_output=False,
     )
     def orbit_get_quota(force_refresh: bool = False) -> types.CallToolResult:
-        now = time.monotonic()
-        if not force_refresh and quota_cache["data"] is not None and (now - quota_cache["ts"]) < 60.0:
-            data = quota_cache["data"]
+        if force_refresh:
+            data = _query_live_quota()
         else:
-            data = query_codex_quota(codex_home=store.sessions_dir.parent)
-            quota_cache["data"] = data
-            quota_cache["ts"] = now
+            data, is_fresh = _read_quota_without_live_query()
+            if data is None:
+                data = _query_live_quota()
+            elif not is_fresh:
+                _trigger_quota_refresh_async()
         return types.CallToolResult(
             content=[types.TextContent(type="text", text="ok")],
             structured_content=data,
@@ -446,13 +689,16 @@ def create_server(
             structured_content={"ui_locale": saved},
         )
 
+    def _settings_payload(settings: OrbitSettings) -> dict[str, Any]:
+        return {
+            **settings.to_dict(),
+            "available_models": read_codex_model_catalog(store.sessions_dir.parent),
+        }
+
     def settings_result(settings: OrbitSettings) -> types.CallToolResult:
         return types.CallToolResult(
             content=[types.TextContent(type="text", text="Codex Orbit settings")],
-            structured_content={
-                **settings.to_dict(),
-                "available_models": read_codex_model_catalog(store.sessions_dir.parent),
-            },
+            structured_content=_settings_payload(settings),
         )
 
     @mcp.tool(
@@ -467,7 +713,10 @@ def create_server(
     @mcp.tool(
         name="orbit_update_settings",
         title="Update Codex Orbit settings",
-        description="Update the supplied settings. Pass an empty model name to restore its default.",
+        description=(
+            "Update the supplied settings. Pass an empty model name to restore its default, "
+            "or an empty reasoning effort or 'auto' to restore policy selection."
+        ),
         meta=APP_ONLY_META,
         structured_output=False,
     )
@@ -478,6 +727,7 @@ def create_server(
         escalation_model: str | None = None,
         quota_guardrail_enabled: bool | None = None,
         quota_guardrail_threshold_pct: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> types.CallToolResult:
         updates = {
             "routing_mode": routing_mode,
@@ -486,9 +736,13 @@ def create_server(
             "escalation_model": escalation_model,
             "quota_guardrail_enabled": quota_guardrail_enabled,
             "quota_guardrail_threshold_pct": quota_guardrail_threshold_pct,
+            "reasoning_effort": reasoning_effort,
         }
         fields = {name: value for name, value in updates.items() if value is not None}
-        settings = save_settings(resolved_data_dir, **fields) if fields else load_settings(resolved_data_dir)
+        try:
+            settings = save_settings(resolved_data_dir, **fields) if fields else load_settings(resolved_data_dir)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
         return settings_result(settings)
 
     @mcp.tool(
@@ -536,6 +790,43 @@ def create_server(
             structured_content=overview,
         )
 
+    @mcp.tool(
+        name="orbit_bootstrap",
+        title="Load Codex Orbit app",
+        description="Load sessions, projects, settings, and cached quota in one app call.",
+        meta=APP_ONLY_META,
+        structured_output=False,
+    )
+    def orbit_bootstrap(
+        query: str = "",
+        limit: int = 100,
+        include_overview: bool = False,
+        project_dir: str = "",
+    ) -> types.CallToolResult:
+        payload = _session_list_payload(query, limit)
+        quota, is_fresh = _read_quota_without_live_query()
+        if not is_fresh:
+            _trigger_quota_refresh_async()
+        payload.update(
+            settings=_settings_payload(load_settings(resolved_data_dir)),
+            quota=quota,
+            quota_stale=not is_fresh,
+            overview=build_profile_overview(store, data_dir=resolved_data_dir, project_dir=project_dir)
+            if include_overview else None,
+        )
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=f"{len(payload['sessions'])} sessions")],
+            structured_content=payload,
+        )
+
+    if warmup:
+        def _warm_caches() -> None:
+            if read_cached_codex_quota(data_dir=resolved_data_dir) is None:
+                _trigger_quota_refresh_async()
+            store.list_sessions(limit=100)
+
+        threading.Thread(target=_warm_caches, daemon=True).start()
+
     return mcp
 
 
@@ -554,6 +845,7 @@ def main(argv: list[str] | None = None) -> None:
         html_path=Path(args.html_path) if args.html_path else None,
         data_dir=Path(args.data_dir) if args.data_dir else None,
         write_pointer=True,
+        warmup=True,
     )
     server.run(transport="stdio")
 

@@ -7,6 +7,8 @@ import shutil
 import time
 from pathlib import Path
 
+import pytest
+
 from server.rollout_parser import RolloutParseState
 from server.session_store import SessionStore
 
@@ -45,6 +47,62 @@ def test_parse_structured_rollout_fixture() -> None:
     assert turn.commands[0].exit_code == 0
     assert turn.commands[0].duration_ms == 1250
     assert turn.duration_ms == 3250
+
+
+@pytest.mark.parametrize(
+    "effort_fields,expected",
+    [
+        ({"effort": " low ", "reasoning_effort": "medium"}, "low"),
+        ({"effort": " ", "reasoning_effort": " medium ", "collaboration_mode": {
+            "settings": {"reasoning_effort": "high"},
+        }}, "medium"),
+        ({"effort": False, "collaboration_mode": {"settings": {
+            "reasoning_effort": " high ", "effort": "xhigh",
+        }}}, "high"),
+        ({"collaboration_mode": {"settings": {"reasoning_effort": " ", "effort": " xhigh "}}}, "xhigh"),
+        ({"collaboration_mode": {"settings": "malformed"}}, None),
+        ({"collaboration_mode": None}, None),
+    ],
+)
+def test_turn_context_effort_sources(tmp_path: Path, effort_fields: dict, expected: str | None) -> None:
+    rollout = tmp_path / FIXTURE_PATH.name
+    record = {"type": "turn_context", "payload": {"turn_id": "turn-001", **effort_fields}}
+    rollout.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    state = RolloutParseState(rollout)
+    state.feed_file()
+    detail = state.build_detail()
+    assert detail.turns[0].effort == detail.summary.reasoning_effort == expected
+
+
+def test_turn_effort_inheritance_and_latest_summary(tmp_path: Path) -> None:
+    rollout = tmp_path / FIXTURE_PATH.name
+    state = RolloutParseState(rollout)
+
+    def append(record_type: str, **payload: object) -> None:
+        with rollout.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": record_type, "payload": payload}) + "\n")
+
+    append("turn_context", turn_id="turn-001")
+    append("turn_context", turn_id="turn-002")
+    assert state.feed_file() == (True, False, ["turn-001", "turn-002"])
+    assert [turn.effort for turn in state.build_turns()] == [None, None]
+
+    append("event_msg", type="thread_settings_applied", thread_settings={"model": "custom", "reasoning_effort": "high"})
+    assert state.feed_file() == (True, False, ["turn-002"])
+    assert [(turn.model, turn.effort) for turn in state.build_turns()] == [(None, None), ("custom", "high")]
+
+    append("event_msg", type="task_started", turn_id="turn-001")
+    append("event_msg", type="task_started", turn_id="turn-003")
+    assert state.feed_file() == (True, False, ["turn-001", "turn-003"])
+    assert [turn.effort for turn in state.build_turns()] == ["high", "high", "high"]
+
+    append("turn_context", turn_id="turn-003", effort="xhigh")
+    append("event_msg", type="thread_settings_applied", thread_settings={"reasoning_effort": "low"})
+    state.feed_file()
+    assert state.reasoning_effort == "low"
+    detail = state.build_detail()
+    assert [turn.effort for turn in detail.turns] == ["high", "high", "xhigh"]
+    assert detail.summary.reasoning_effort == "xhigh"
 
 
 def test_incremental_tail_and_incomplete_trailing_line(tmp_path: Path) -> None:

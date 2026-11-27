@@ -143,6 +143,12 @@ export interface Strings {
   settingsTitle: string;
   defaultModelLabel: string;
   escalationModelLabel: string;
+  reasoningEffortLabel: string;
+  reasoningEffortAuto: string;
+  reasoningEffortAutoShort: string;
+  reasoningEffortAutoWithDefault: (effort: string) => string;
+  reasoningEffortAria: string;
+  reasoningEffortTip: string;
   guardrailLabel: string;
   guardrailThresholdLabel: string;
   diagnosticsTitle: string;
@@ -156,6 +162,33 @@ export interface Strings {
   pruneResultToast: (removed: number, skipped: number) => string;
   quotaLowWarning: (threshold: number) => string;
   toastSettingsSaved: string;
+  followupPlaceholder: string;
+  followupRunningPlaceholder: string;
+  followupSendingPlaceholder: string;
+  followupWebSearch: string;
+  followupWebSearchTip: string;
+  followupSendAria: string;
+  toastFollowupStarted: string;
+  toastFollowupFailed: (e: string) => string;
+  writerBusyHint: string;
+  newProject: string;
+  newProjectTitle: string;
+  projectPathLabel: string;
+  projectPathPlaceholder: string;
+  createDirIfMissing: string;
+  createProjectBtn: string;
+  toastProjectCreated: (name: string) => string;
+  newChatInProject: (name: string) => string;
+  newChatTitle: string;
+  sessionTitleLabel: string;
+  sessionTitlePlaceholder: string;
+  sessionPromptLabel: string;
+  sessionPromptPlaceholder: string;
+  sessionModeLabel: string;
+  startChatBtn: string;
+  toastSessionStarted: string;
+  cancelBtn: string;
+  emptyProjectHint: string;
   recentSessionsTitle: string;
   hotFilesTitle: string;
   touchedBySessions: (n: number) => string;
@@ -168,6 +201,7 @@ export interface Strings {
   summaryRoundHeading: (round: number) => string;
   summaryWorkspace: string;
   summaryIsolation: string;
+  summaryEffort: string;
   summaryStatus: string;
   summaryStats: (cmds: number, files: number, dur: string) => string;
   summaryFiles: string;
@@ -264,6 +298,12 @@ const ZH_CN: Strings = {
   settingsTitle: "调度设置与环境诊断",
   defaultModelLabel: "默认主力模型",
   escalationModelLabel: "复杂升级模型",
+  reasoningEffortLabel: "默认思考深度",
+  reasoningEffortAuto: "自动（按调度策略）",
+  reasoningEffortAutoShort: "思考: 自动",
+  reasoningEffortAutoWithDefault: (effort) => `思考: 自动 (${effort})`,
+  reasoningEffortAria: "思考深度",
+  reasoningEffortTip: "设置本轮或新建会话的 Codex 推理思考深度",
   guardrailLabel: "低额度自动保护",
   guardrailThresholdLabel: "5h 触发阈值",
   diagnosticsTitle: "环境自检",
@@ -277,6 +317,33 @@ const ZH_CN: Strings = {
   pruneResultToast: (removed, skipped) => `已清理 ${removed} 个 worktree${skipped > 0 ? `，跳过 ${skipped} 个运行中` : ""}`,
   quotaLowWarning: (threshold) => `⚠ 5h 剩余额度低于 ${threshold}%，低额度保护已就绪。`,
   toastSettingsSaved: "设置已保存",
+  followupPlaceholder: "向 Codex 跟进此会话… (Enter 发送，Shift+Enter 换行)",
+  followupRunningPlaceholder: "Codex 正在执行当前轮次…",
+  followupSendingPlaceholder: "正在连接会话…",
+  followupWebSearch: "联网",
+  followupWebSearchTip: "允许 Codex 在本轮使用联网搜索",
+  followupSendAria: "发送给 Codex",
+  toastFollowupStarted: "已发送，正在连接会话…",
+  toastFollowupFailed: (e) => `发送失败：${e}`,
+  writerBusyHint: "该会话仍在 Codex Desktop 中占用写锁。请在 Desktop 中继续，或先在 Desktop 中关闭该会话后重试。",
+  newProject: "新建项目",
+  newProjectTitle: "新建项目",
+  projectPathLabel: "项目目录路径",
+  projectPathPlaceholder: "例如 D:\\projects\\my-app",
+  createDirIfMissing: "若目录不存在则自动创建",
+  createProjectBtn: "添加项目",
+  toastProjectCreated: (name) => `已添加项目：${name}`,
+  newChatInProject: (name) => `在 ${name} 中新建对话`,
+  newChatTitle: "新建对话窗口",
+  sessionTitleLabel: "会话标题（可选）",
+  sessionTitlePlaceholder: "留空则自动根据首句生成",
+  sessionPromptLabel: "首轮指令",
+  sessionPromptPlaceholder: "输入要交给 Codex 的任务…（Enter 发送，Shift+Enter 换行）",
+  sessionModeLabel: "执行模式",
+  startChatBtn: "开始对话",
+  toastSessionStarted: "已创建新对话",
+  cancelBtn: "取消",
+  emptyProjectHint: "暂无会话，点击右侧 + 新建对话",
   recentSessionsTitle: "最近会话",
   hotFilesTitle: "高频改动文件",
   touchedBySessions: (n) => `${n} 个会话`,
@@ -288,6 +355,7 @@ const ZH_CN: Strings = {
   summaryRoundHeading: (r) => `### Codex Orbit 摘要（第 ${r} 轮）`,
   summaryWorkspace: "工作区",
   summaryIsolation: "模式",
+  summaryEffort: "思考深度",
   summaryStatus: "状态",
   summaryStats: (c, f, d) => `${c} 条命令，${f} 个改动文件，耗时 ${d}`,
   summaryFiles: "改动文件",
@@ -384,6 +452,12 @@ const ZH_TW: Strings = {
   settingsTitle: "排程設定與環境診斷",
   defaultModelLabel: "預設主力模型",
   escalationModelLabel: "複雜升級模型",
+  reasoningEffortLabel: "預設思考深度",
+  reasoningEffortAuto: "自動（依排程策略）",
+  reasoningEffortAutoShort: "思考: 自動",
+  reasoningEffortAutoWithDefault: (effort) => `思考: 自動 (${effort})`,
+  reasoningEffortAria: "思考深度",
+  reasoningEffortTip: "設定本輪或新對話的 Codex 推理思考深度",
   guardrailLabel: "低額度自動保護",
   guardrailThresholdLabel: "5h 觸發門檻",
   diagnosticsTitle: "環境自檢",
@@ -397,6 +471,33 @@ const ZH_TW: Strings = {
   pruneResultToast: (removed, skipped) => `已清理 ${removed} 個 worktree${skipped > 0 ? `，略過 ${skipped} 個執行中` : ""}`,
   quotaLowWarning: (threshold) => `⚠ 5h 剩餘額度低於 ${threshold}%，低額度保護已啟用。`,
   toastSettingsSaved: "設定已儲存",
+  followupPlaceholder: "向 Codex 跟進此工作階段… (Enter 傳送，Shift+Enter 換行)",
+  followupRunningPlaceholder: "Codex 正在執行目前輪次…",
+  followupSendingPlaceholder: "正在連線工作階段…",
+  followupWebSearch: "聯網",
+  followupWebSearchTip: "允許 Codex 在本輪使用聯網搜尋",
+  followupSendAria: "傳送給 Codex",
+  toastFollowupStarted: "已傳送，正在連線工作階段…",
+  toastFollowupFailed: (e) => `傳送失敗：${e}`,
+  writerBusyHint: "此工作階段仍在 Codex Desktop 中佔用寫鎖。請於 Desktop 中繼續，或先在 Desktop 中關閉該工作階段後重試。",
+  newProject: "新增專案",
+  newProjectTitle: "新增專案",
+  projectPathLabel: "專案目錄路徑",
+  projectPathPlaceholder: "例如 D:\\projects\\my-app",
+  createDirIfMissing: "若目錄不存在則自動建立",
+  createProjectBtn: "新增專案",
+  toastProjectCreated: (name) => `已新增專案：${name}`,
+  newChatInProject: (name) => `在 ${name} 中建立新對話`,
+  newChatTitle: "新增對話視窗",
+  sessionTitleLabel: "工作階段標題（選填）",
+  sessionTitlePlaceholder: "留空則依首句自動產生",
+  sessionPromptLabel: "首輪指令",
+  sessionPromptPlaceholder: "輸入要交給 Codex 的任務…（Enter 傳送，Shift+Enter 換行）",
+  sessionModeLabel: "執行模式",
+  startChatBtn: "開始對話",
+  toastSessionStarted: "已建立新對話",
+  cancelBtn: "取消",
+  emptyProjectHint: "尚無工作階段，點擊右側 + 新增對話",
   recentSessionsTitle: "最近工作階段",
   hotFilesTitle: "高頻變更檔案",
   touchedBySessions: (n) => `${n} 個工作階段`,
@@ -408,6 +509,7 @@ const ZH_TW: Strings = {
   summaryRoundHeading: (r) => `### Codex Orbit 摘要（第 ${r} 輪）`,
   summaryWorkspace: "工作區",
   summaryIsolation: "模式",
+  summaryEffort: "思考深度",
   summaryStatus: "狀態",
   summaryStats: (c, f, d) => `${c} 條指令，${f} 個變更檔案，耗時 ${d}`,
   summaryFiles: "變更檔案",
@@ -504,6 +606,12 @@ const EN: Strings = {
   settingsTitle: "Routing & Diagnostics",
   defaultModelLabel: "Default model",
   escalationModelLabel: "Escalation model",
+  reasoningEffortLabel: "Default reasoning effort",
+  reasoningEffortAuto: "Auto (by policy)",
+  reasoningEffortAutoShort: "Effort: Auto",
+  reasoningEffortAutoWithDefault: (effort) => `Effort: Auto (${effort})`,
+  reasoningEffortAria: "Reasoning effort",
+  reasoningEffortTip: "Set Codex reasoning effort for this turn or new session",
   guardrailLabel: "Low-quota guardrail",
   guardrailThresholdLabel: "5h threshold",
   diagnosticsTitle: "Environment Check",
@@ -517,6 +625,33 @@ const EN: Strings = {
   pruneResultToast: (removed, skipped) => `Pruned ${removed} worktree(s)${skipped > 0 ? `, skipped ${skipped} running` : ""}`,
   quotaLowWarning: (threshold) => `⚠ 5h quota is below ${threshold}% guardrail threshold.`,
   toastSettingsSaved: "Settings saved",
+  followupPlaceholder: "Follow up with Codex… (Enter to send, Shift+Enter for newline)",
+  followupRunningPlaceholder: "Codex is running the current turn…",
+  followupSendingPlaceholder: "Connecting to session…",
+  followupWebSearch: "Web",
+  followupWebSearchTip: "Enable live web search for this follow-up",
+  followupSendAria: "Send to Codex",
+  toastFollowupStarted: "Connecting to session…",
+  toastFollowupFailed: (e) => `Send failed: ${e}`,
+  writerBusyHint: "This thread is still locked by Codex Desktop. Continue there or close/unload it in Desktop, then retry.",
+  newProject: "New Project",
+  newProjectTitle: "New Project",
+  projectPathLabel: "Workspace directory",
+  projectPathPlaceholder: "e.g. D:\\projects\\my-app",
+  createDirIfMissing: "Create directory if missing",
+  createProjectBtn: "Add Project",
+  toastProjectCreated: (name) => `Added project: ${name}`,
+  newChatInProject: (name) => `New chat in ${name}`,
+  newChatTitle: "New Conversation",
+  sessionTitleLabel: "Title (optional)",
+  sessionTitlePlaceholder: "Auto-generated from prompt if blank",
+  sessionPromptLabel: "Prompt",
+  sessionPromptPlaceholder: "Describe the task for Codex… (Enter to send, Shift+Enter for newline)",
+  sessionModeLabel: "Mode",
+  startChatBtn: "Start Chat",
+  toastSessionStarted: "New conversation started",
+  cancelBtn: "Cancel",
+  emptyProjectHint: "No sessions yet — click + to start",
   recentSessionsTitle: "Recent Sessions",
   hotFilesTitle: "Frequently Modified Files",
   touchedBySessions: (n) => (n === 1 ? "1 session" : `${n} sessions`),
@@ -528,6 +663,7 @@ const EN: Strings = {
   summaryRoundHeading: (r) => `### Codex Orbit Summary (Round ${r})`,
   summaryWorkspace: "Workspace",
   summaryIsolation: "Mode",
+  summaryEffort: "Effort",
   summaryStatus: "Status",
   summaryStats: (c, f, d) => `${c} commands, ${f} changed files, ${d}`,
   summaryFiles: "Changed files",
@@ -624,6 +760,12 @@ const JA: Strings = {
   settingsTitle: "設定と環境診断",
   defaultModelLabel: "標準モデル",
   escalationModelLabel: "上位モデル",
+  reasoningEffortLabel: "既定の推論強度",
+  reasoningEffortAuto: "自動（ポリシーに従う）",
+  reasoningEffortAutoShort: "強度: 自動",
+  reasoningEffortAutoWithDefault: (effort) => `強度: 自動 (${effort})`,
+  reasoningEffortAria: "推論強度",
+  reasoningEffortTip: "このターンまたは新規チャットの Codex 推論強度を設定",
   guardrailLabel: "低残量ガードレール",
   guardrailThresholdLabel: "5h しきい値",
   diagnosticsTitle: "環境診断",
@@ -637,6 +779,33 @@ const JA: Strings = {
   pruneResultToast: (removed, skipped) => `${removed} 件の worktree を削除${skipped > 0 ? `（実行中 ${skipped} 件をスキップ）` : ""}`,
   quotaLowWarning: (threshold) => `⚠ 5h 残量が ${threshold}% 未満のためガードレールが有効です。`,
   toastSettingsSaved: "設定を保存しました",
+  followupPlaceholder: "Codex に続けて指示… (Enter で送信、Shift+Enter で改行)",
+  followupRunningPlaceholder: "Codex が現在のターンを実行中…",
+  followupSendingPlaceholder: "セッションに接続中…",
+  followupWebSearch: "Web",
+  followupWebSearchTip: "この追指示で Web 検索を有効化",
+  followupSendAria: "Codex に送信",
+  toastFollowupStarted: "セッションに接続中…",
+  toastFollowupFailed: (e) => `送信に失敗: ${e}`,
+  writerBusyHint: "このスレッドは Codex Desktop でロックされています。Desktop で続行するか、スレッドを閉じてから再試行してください。",
+  newProject: "新規プロジェクト",
+  newProjectTitle: "新規プロジェクト",
+  projectPathLabel: "ワークスペースディレクトリ",
+  projectPathPlaceholder: "例: D:\\projects\\my-app",
+  createDirIfMissing: "存在しない場合はディレクトリを作成",
+  createProjectBtn: "プロジェクトを追加",
+  toastProjectCreated: (name) => `プロジェクトを追加しました: ${name}`,
+  newChatInProject: (name) => `${name} で新規チャット`,
+  newChatTitle: "新規チャット",
+  sessionTitleLabel: "タイトル（任意）",
+  sessionTitlePlaceholder: "空欄の場合はプロンプトから自動生成",
+  sessionPromptLabel: "プロンプト",
+  sessionPromptPlaceholder: "Codex への指示を入力…（Enter で送信、Shift+Enter で改行）",
+  sessionModeLabel: "実行モード",
+  startChatBtn: "チャット開始",
+  toastSessionStarted: "新しいチャットを開始しました",
+  cancelBtn: "キャンセル",
+  emptyProjectHint: "セッションなし — 右側の + で開始",
   recentSessionsTitle: "最近のセッション",
   hotFilesTitle: "よく変更されるファイル",
   touchedBySessions: (n) => `${n} 件のセッション`,
@@ -648,6 +817,7 @@ const JA: Strings = {
   summaryRoundHeading: (r) => `### Codex Orbit 要約（第 ${r} 回）`,
   summaryWorkspace: "ワークスペース",
   summaryIsolation: "モード",
+  summaryEffort: "推論強度",
   summaryStatus: "ステータス",
   summaryStats: (c, f, d) => `コマンド ${c} 件、変更ファイル ${f} 件、所要時間 ${d}`,
   summaryFiles: "変更ファイル",
@@ -793,6 +963,53 @@ export function routingModeLabel(mode: RoutingMode, locale: ResolvedLocale): str
     case "silent_best":
       return "Max";
   }
+}
+
+export function effortShortLabel(effort: string | null | undefined, locale: ResolvedLocale): string {
+  if (!effort) return "";
+  const low = effort.toLowerCase();
+  if (locale === "en") {
+    const enMap: Record<string, string> = {
+      low: "Low",
+      medium: "Medium",
+      high: "High",
+      xhigh: "XHigh",
+      max: "Max",
+      ultra: "Ultra",
+    };
+    return enMap[low] ?? effort;
+  }
+  if (locale === "zh-TW") {
+    const twMap: Record<string, string> = {
+      low: "低",
+      medium: "中",
+      high: "高",
+      xhigh: "極高",
+      max: "最大",
+      ultra: "Ultra",
+    };
+    return twMap[low] ?? effort;
+  }
+  if (locale === "ja") {
+    const jaMap: Record<string, string> = {
+      low: "低",
+      medium: "中",
+      high: "高",
+      xhigh: "超高",
+      max: "最大",
+      ultra: "Ultra",
+    };
+    return jaMap[low] ?? effort;
+  }
+  const map: Record<string, string> = {
+    low: "低",
+    medium: "中",
+    high: "高",
+    xhigh: "极高",
+    max: "最大",
+    ultra: "Ultra",
+  };
+  return map[low] ?? effort;
 }
 
 export function effortLabel(effort: string | null | undefined, locale: ResolvedLocale): string {

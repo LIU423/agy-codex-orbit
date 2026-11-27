@@ -16,7 +16,8 @@ Always read [references/model_profile.md](references/model_profile.md) before dr
    - **Codex (delegate)**: Backend architecture, APIs, business logic, parsers, persistence/SQL, CLI/systems tooling, complex debugging, backend tests, and independent read-only code reviews.
 2. **Classify Task Tier & Check Active Routing Policy**:
    - Classify the delegated backend task as `--task-tier light | standard | complex` per [references/model_profile.md](references/model_profile.md).
-   - Resolve the active persisted policy (`silent_low_cost` | `ask` [default] | `silent_best`), configurable default/escalation models, and low-quota guardrail before dispatching:
+   - **Fast single-step dispatch for `light` / `standard` tasks**: Skip `--plan-route` and invoke `delegate_cli.py` directly with `--task-tier light | standard` (omitting hardcoded `--model` / `--reasoning-effort` unless the user explicitly requested overrides). `delegate_cli.py` reads the persisted settings (`silent_low_cost` | `ask` | `silent_best`) and 60s cached quota guardrail automatically.
+   - **Pre-flight check for `complex` tasks**: Run `--plan-route --task-tier complex --mode <mode>` first (fast via 60s disk quota cache) so `ask` mode confirms before drafting a long brief; or pass `--confirm-if-needed` in a single step so `delegate_cli.py` exits cleanly with `{"status": "needs_confirmation", ...}` without starting Codex when confirmation is needed:
      - **Windows (PowerShell)**:
        ```powershell
        $rt = Get-Content "$env:LOCALAPPDATA\agy-codex-orbit\runtime.json" -Raw | ConvertFrom-Json
@@ -34,6 +35,7 @@ Always read [references/model_profile.md](references/model_profile.md) before dr
 3. **Switching Policies, Models & Running Diagnostics via Chat**:
    - When the user asks to change routing policy, models, or guardrail settings, persist them immediately so future turns and the **Codex Orbit** UI stay synchronized:
      - `--set-routing-mode silent_low_cost | ask | silent_best`
+     - `--set-reasoning-effort auto | low | medium | high | xhigh | max | ultra`
      - `--set-default-model <slug>` / `--set-escalation-model <slug>` (empty string restores default)
      - `--set-quota-guardrail on | off` / `--set-quota-threshold <5..50>`
      - `--get-settings` / `--doctor` / `--prune-worktrees`
@@ -47,8 +49,12 @@ Always read [references/model_profile.md](references/model_profile.md) before dr
 2. **Codex Desktop Project & `agy:` Window Title**:
    - ALWAYS pass `--title "<concise task name>"`. `delegate_cli.py` automatically prefixes it as `agy: <concise task name>` via Codex's official `thread/name/set` RPC, and binds the session into the matching Codex Desktop project for that workspace (creating the project cleanly if missing, with backup & graceful degradation).
 3. **Auto-Open Right Side Pane, Zero Polling & No Auto-Merge/Push**:
-   - Launch `delegate_cli.py` via `run_command` with `WaitMsBeforeAsync: 5000` and `NotificationTimeoutSeconds: 600`.
-   - **Pop open the right auxiliary pane automatically**: In the same turn as launching `delegate_cli.py` (or right after it backgrounds), invoke MCP tool `open_codex_orbit` on server `agy-codex-orbit_codex_orbit` with `{"focus_running": true, "workspace_dir": "<CWD>"}` (for Round 1) or `{"session_id": "<SESSION_ID>", "focus_running": true}` (for follow-up rounds). Antigravity auto-opens or updates the right **Codex Orbit** side pane to display live progress at zero model tokens.
+   - Launch `delegate_cli.py` via `run_command` with `WaitMsBeforeAsync: 1000` and `NotificationTimeoutSeconds: 600`.
+   - **Pop open the right auxiliary pane automatically**: In the same turn as launching `delegate_cli.py` (or right after it backgrounds), invoke `call_mcp_tool` directly without spending a turn on `read_file` for `open_codex_orbit.json`:
+     - Server: `agy-codex-orbit_codex_orbit`, Tool: `open_codex_orbit`
+     - Round 1 Arguments (JSON object): `{"focus_running": true, "workspace_dir": "<CWD>"}`
+     - Follow-up Arguments (JSON object): `{"session_id": "<SESSION_ID>", "focus_running": true}`
+     Antigravity auto-opens or updates the right **Codex Orbit** side pane to display live progress at zero model tokens.
    - Immediately **stop calling tools and wait** for Antigravity's completion notification. NEVER poll logs or status in a loop.
    - Never auto-merge or push without explicit user approval.
 
@@ -80,13 +86,13 @@ Definition of Done & Review Criteria:
 $prompt | & $rt.python_bin -u $rt.delegate_cli `
   --cwd "<ANTIGRAVITY_WORKSPACE>" `
   --mode workspace-write `
-  --model gpt-6.2-sol `
-  --reasoning-effort high `
+  --task-tier standard `
   --title "<简洁任务名>" `
   --source-model "Gemini"
 ```
 
-- For read-only review: change `--mode workspace-write` to `--mode read-only` and `--reasoning-effort medium` (or `high`).
+- Explicit `--model <slug>` and `--reasoning-effort <level>` overrides remain supported whenever the user specifies them (or after `ask` mode confirms escalation).
+- For read-only review: change `--mode workspace-write` to `--mode read-only` (e.g. `--task-tier standard` or explicit `--reasoning-effort medium` / `high`).
 - For live external web research (e.g., company/market/documentation research in non-Git or Git workspaces such as `Career`):
   - Pass `--web-search` (enables Codex's native live `web_search` tool via `codex --search`).
   - When Gemini needs to read and interpret a detailed report (>1,800 chars) for the user, use `--mode workspace-write` and instruct Codex to write the full cited Markdown report to a workspace path (e.g., `research/<topic>.md`). Non-Git workspaces work automatically (`--skip-git-repo-check`). Once Codex finishes, read that Markdown file directly in Antigravity and synthesize/explain it against the user's local context.

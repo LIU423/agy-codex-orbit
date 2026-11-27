@@ -110,6 +110,7 @@ def terminate_process_tree(pid: int | None, *, wait_seconds: float = 2.0) -> boo
                 errors="replace",
                 timeout=8,
                 check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if result.returncode != 0:
                 _win32_terminate_tree(pid)

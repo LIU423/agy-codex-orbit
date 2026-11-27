@@ -14,6 +14,10 @@ from server.routing_policy import (
     MODEL_ASTRA,
     MODEL_SOL,
     ROUTING_MODE_LABELS,
+    VALID_EFFORTS,
+    VALID_REASONING_EFFORT_SETTINGS,
+    VALID_ROUTING_MODES,
+    VALID_TASK_TIERS,
     VALID_UI_LOCALES,
     OrbitSettings,
     load_routing_mode,
@@ -175,7 +179,8 @@ def test_settings_upgrades_legacy_file_atomically(
         b"\xff",
         b"[]",
         b'{"routing_mode":"invalid","ui_locale":"fr","default_model":null,"escalation_model":false,'
-        b'"quota_guardrail_enabled":"false","quota_guardrail_threshold_pct":true}',
+        b'"quota_guardrail_enabled":"false","quota_guardrail_threshold_pct":true,"reasoning_effort":"unknown"}',
+        b'{"reasoning_effort":42}',
     ],
 )
 def test_invalid_settings_load_defaults(tmp_path: Path, raw: bytes) -> None:
@@ -183,12 +188,52 @@ def test_invalid_settings_load_defaults(tmp_path: Path, raw: bytes) -> None:
     assert load_settings(tmp_path) == OrbitSettings()
 
 
-@pytest.mark.parametrize("updates", [{"ui_locale": "fr"}, {"quota_guardrail_threshold_pct": 9.5}])
+@pytest.mark.parametrize("updates", [
+    {"ui_locale": "fr"}, {"quota_guardrail_threshold_pct": 9.5},
+    {"reasoning_effort": "extreme"}, {"reasoning_effort": False},
+])
 def test_invalid_settings_update_keeps_previous_file(tmp_path: Path, updates: dict) -> None:
-    original = save_settings(tmp_path, default_model="custom")
+    original = save_settings(tmp_path, default_model="custom", reasoning_effort="xhigh")
     with pytest.raises(ValueError):
         save_settings(tmp_path, default_model="changed", **updates)
     assert load_settings(tmp_path) == original
+
+
+def test_reasoning_effort_settings_persistence_and_resets(tmp_path: Path) -> None:
+    assert VALID_REASONING_EFFORT_SETTINGS == ("auto", *VALID_EFFORTS)
+    assert load_settings(tmp_path).reasoning_effort == "auto"
+    for effort in VALID_EFFORTS:
+        settings = save_settings(tmp_path, reasoning_effort=f" {effort.upper()} ")
+        assert settings.reasoning_effort == effort
+        assert load_settings(tmp_path) == settings
+    for reset in ("", None, " AuTo "):
+        save_settings(tmp_path, reasoning_effort="ultra")
+        assert save_settings(tmp_path, ui_locale="en").reasoning_effort == "ultra"
+        assert save_settings(tmp_path, reasoning_effort=reset).reasoning_effort == "auto"
+        assert json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))["reasoning_effort"] == "auto"
+
+
+@pytest.mark.parametrize("mode", VALID_ROUTING_MODES)
+@pytest.mark.parametrize("tier", VALID_TASK_TIERS)
+def test_route_reasoning_effort_override(mode, tier) -> None:
+    kwargs = {"routing_mode": mode, "task_tier": tier, "isolation_mode": "read-only", "quota_remaining_5h": 4}
+    baseline = resolve_route(**kwargs)
+    for automatic in ("auto", "", " AuTo "):
+        assert resolve_route(**kwargs, reasoning_effort_override=automatic) == baseline
+    override = resolve_route(**kwargs, reasoning_effort_override=" ULTRA ")
+    assert override.reasoning_effort == "ultra"
+    assert override.model == baseline.model
+    assert override.requires_confirmation == baseline.requires_confirmation
+    assert override.guardrail_triggered == baseline.guardrail_triggered
+    if mode == "ask" and tier == "complex":
+        assert override.recommended_effort == override.fallback_effort == "ultra"
+    else:
+        assert override.recommended_effort is override.fallback_effort is None
+
+
+def test_route_rejects_invalid_reasoning_effort_override() -> None:
+    with pytest.raises(ValueError, match="Invalid reasoning_effort"):
+        resolve_route(routing_mode="ask", reasoning_effort_override="extreme")
 
 
 @pytest.mark.parametrize("tier,effort", [("standard", "high"), ("complex", "xhigh")])
@@ -268,7 +313,10 @@ def test_cli_plan_quota_probe_and_override(tmp_path: Path, monkeypatch: pytest.M
     quota = {"codex": {"available": True, "source": "app_server", "primary": {"remaining_percent": 7}}}
     calls: list[str | None] = []
 
-    def query(*, codex_bin: str | None) -> dict:
+    def query(*, codex_bin: str | None, data_dir: Path, use_cache: bool, max_age_seconds: float) -> dict:
+        assert data_dir == tmp_path
+        assert use_cache is True
+        assert max_age_seconds == 60.0
         calls.append(codex_bin)
         return quota
 
@@ -292,24 +340,52 @@ def test_cli_plan_quota_probe_and_override(tmp_path: Path, monkeypatch: pytest.M
     assert result["model"] == settings.default_model
     assert calls == [None]
 
-    override = plan("--routing-mode", "ask", "--task-tier", "complex", "--quota-remaining-5h", "0")
+    override = plan(
+        "--routing-mode", "ask", "--task-tier", "complex", "--quota-remaining-5h", "0", "--reasoning-effort", "max",
+    )
     assert override["quota"]["codex"]["source"] == "override"
     assert override["quota"]["codex"]["primary"]["remaining_percent"] == 0
     assert override["requires_confirmation"] is True
     assert override["guardrail_triggered"] is True
+    assert override["reasoning_effort"] == override["recommended_effort"] == override["fallback_effort"] == "max"
     assert calls == [None]
 
     quota["codex"] = {"available": False, "error": "Quota unavailable"}
-    result = plan("--task-tier", "complex")
+    result = plan("--task-tier", "complex", "--reasoning-effort", "medium")
     assert result["quota"] == quota
     assert result["guardrail_triggered"] is False
     assert result["model"] == settings.escalation_model
+    assert result["reasoning_effort"] == "medium"
     assert calls == [None, None]
 
     save_settings(tmp_path, quota_guardrail_enabled=False)
     assert "quota" not in plan("--task-tier", "complex")
     assert plan("--routing-mode", "ask", "--task-tier", "complex")["quota"] == quota
     assert calls == [None, None, None]
+
+
+def test_cli_reasoning_effort_setting_and_plan(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    def cli(*args: str) -> tuple[int, dict]:
+        return run_delegation(parse_args(["--data-dir", str(tmp_path), *args]))
+
+    with pytest.raises(SystemExit) as result:
+        delegate_cli.main(["--data-dir", str(tmp_path), "--set-reasoning-effort", " MAX "])
+    assert result.value.code == 0
+    assert json.loads(capsys.readouterr().out)["reasoning_effort"] == "max"
+    assert cli("--plan-route")[1]["reasoning_effort"] == "max"
+    assert cli("--plan-route", "--reasoning-effort", "low")[1]["reasoning_effort"] == "low"
+    assert cli("--get-settings")[1]["reasoning_effort"] == "max"
+
+    with pytest.raises(SystemExit) as result:
+        cli("--set-reasoning-effort", "extreme")
+    assert result.value.code == 2
+    assert "--set-reasoning-effort" in capsys.readouterr().err
+    assert load_settings(tmp_path).reasoning_effort == "max"
+
+    for reset in ("", " AUTO "):
+        cli("--set-reasoning-effort", "ULTRA")
+        assert cli("--set-reasoning-effort", reset)[1]["reasoning_effort"] == "auto"
+        assert cli("--plan-route")[1]["reasoning_effort"] == "high"
 
 
 def test_cli_doctor_and_prune_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

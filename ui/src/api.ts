@@ -1,13 +1,19 @@
 import type { App } from "@modelcontextprotocol/ext-apps";
 import type {
   CancelDelegationResult,
+  CreateProjectResult,
+  CreateSessionResult,
   DoctorReport,
+  IsolationMode,
   ListSessionsResponse,
+  OrbitBootstrapResponse,
   OrbitSettingsResponse,
   ProfileOverviewResponse,
   PruneWorktreesResult,
   QuotaStatus,
+  ReasoningEffortSetting,
   RoutingMode,
+  SendFollowupResult,
   SessionDelta,
   SessionDetail,
   UiLocale,
@@ -38,6 +44,24 @@ function extractPayload<T>(result: ToolCallResultLike): T {
 
 export class OrbitApi {
   constructor(private readonly app: App) {}
+
+  async bootstrap(
+    query = "",
+    limit = 100,
+    includeOverview = false,
+    projectDir = "",
+  ): Promise<OrbitBootstrapResponse> {
+    const res = await this.app.callServerTool({
+      name: "orbit_bootstrap",
+      arguments: {
+        query,
+        limit,
+        include_overview: includeOverview,
+        project_dir: projectDir,
+      },
+    });
+    return extractPayload<OrbitBootstrapResponse>(res as ToolCallResultLike);
+  }
 
   async listSessions(query = "", limit = 100): Promise<ListSessionsResponse> {
     const res = await this.app.callServerTool({
@@ -150,6 +174,7 @@ export class OrbitApi {
     escalation_model?: string;
     quota_guardrail_enabled?: boolean;
     quota_guardrail_threshold_pct?: number;
+    reasoning_effort?: ReasoningEffortSetting;
   }): Promise<OrbitSettingsResponse> {
     const res = await this.app.callServerTool({
       name: "orbit_update_settings",
@@ -172,5 +197,65 @@ export class OrbitApi {
       arguments: {},
     });
     return extractPayload<PruneWorktreesResult>(res as ToolCallResultLike);
+  }
+
+  async sendFollowup(
+    sessionId: string,
+    prompt: string,
+    webSearch = false,
+    reasoningEffort?: ReasoningEffortSetting,
+  ): Promise<SendFollowupResult> {
+    const args: Record<string, unknown> = {
+      session_id: sessionId,
+      prompt,
+      web_search: webSearch,
+    };
+    if (reasoningEffort !== undefined) {
+      args.reasoning_effort = reasoningEffort;
+    }
+    const res = await this.app.callServerTool({
+      name: "orbit_send_followup",
+      arguments: args,
+    });
+    return extractPayload<SendFollowupResult>(res as ToolCallResultLike);
+  }
+
+  async createProject(
+    workspaceDir: string,
+    createIfMissing = false,
+  ): Promise<CreateProjectResult> {
+    const res = await this.app.callServerTool({
+      name: "orbit_create_project",
+      arguments: {
+        workspace_dir: workspaceDir,
+        create_if_missing: createIfMissing,
+      },
+    });
+    return extractPayload<CreateProjectResult>(res as ToolCallResultLike);
+  }
+
+  async createSession(
+    workspaceDir: string,
+    prompt: string,
+    title = "",
+    mode: IsolationMode = "workspace-write",
+    webSearch = false,
+    reasoningEffort?: ReasoningEffortSetting,
+  ): Promise<CreateSessionResult> {
+    const args: Record<string, unknown> = {
+      workspace_dir: workspaceDir,
+      prompt,
+      title,
+      mode,
+      web_search: webSearch,
+    };
+    if (reasoningEffort !== undefined) {
+      args.reasoning_effort = reasoningEffort;
+    }
+    const res = await this.app.callServerTool({
+      name: "orbit_create_session",
+      arguments: args,
+    });
+    return extractPayload<CreateSessionResult>(res as ToolCallResultLike);
   }
 }

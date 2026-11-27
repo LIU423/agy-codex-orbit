@@ -9,6 +9,7 @@ import { renderActivityHeatmap } from "./heatmap";
 import { escapeHtml, renderSafeMarkdown } from "./markdown";
 import {
   effortLabel,
+  effortShortLabel,
   formatCompactNumber,
   formatDays,
   formatRelativeTime,
@@ -25,11 +26,15 @@ import type {
   DoctorReport,
   FileChangeRecord,
   HeatmapMetric,
+  IsolationMode,
   ModelCatalogEntry,
   OpenOrbitBootstrap,
   OriginFilter,
   ProfileOverviewResponse,
+  ProjectEntry,
   QuotaStatus,
+  ReasoningEffort,
+  ReasoningEffortSetting,
   ResolvedLocale,
   RoutingMode,
   SessionDetail,
@@ -40,6 +45,7 @@ import type {
 
 interface UiState {
   sessions: SessionSummary[];
+  projects: ProjectEntry[];
   sessionsDir: string;
   sessionsDirExists: boolean;
   query: string;
@@ -74,6 +80,7 @@ interface UiState {
   hostLocale: string | null;
   defaultModel: string;
   escalationModel: string;
+  reasoningEffort: ReasoningEffortSetting;
   quotaGuardrailEnabled: boolean;
   quotaGuardrailThresholdPct: number;
   availableModels: ModelCatalogEntry[];
@@ -81,10 +88,28 @@ interface UiState {
   doctorReport: DoctorReport | null;
   runningDoctor: boolean;
   pruningWorktrees: boolean;
+  followupDraft: string;
+  followupWebSearch: boolean;
+  followupEffort: ReasoningEffortSetting;
+  sendingFollowup: boolean;
+  newProjectOpen: boolean;
+  newProjectDir: string;
+  newProjectCreateMissing: boolean;
+  newProjectSubmitting: boolean;
+  newProjectError: string | null;
+  newChatProject: { projectDir: string; projectName: string } | null;
+  newChatTitle: string;
+  newChatPrompt: string;
+  newChatMode: IsolationMode;
+  newChatEffort: ReasoningEffortSetting;
+  newChatWebSearch: boolean;
+  newChatSubmitting: boolean;
+  newChatError: string | null;
 }
 
 const state: UiState = {
   sessions: [],
+  projects: [],
   sessionsDir: "",
   sessionsDirExists: true,
   query: "",
@@ -119,6 +144,7 @@ const state: UiState = {
   hostLocale: null,
   defaultModel: "gpt-6.2-sol",
   escalationModel: "gpt-6.2-astra",
+  reasoningEffort: "auto",
   quotaGuardrailEnabled: true,
   quotaGuardrailThresholdPct: 15,
   availableModels: [],
@@ -126,6 +152,23 @@ const state: UiState = {
   doctorReport: null,
   runningDoctor: false,
   pruningWorktrees: false,
+  followupDraft: "",
+  followupWebSearch: false,
+  followupEffort: "auto",
+  sendingFollowup: false,
+  newProjectOpen: false,
+  newProjectDir: "",
+  newProjectCreateMissing: true,
+  newProjectSubmitting: false,
+  newProjectError: null,
+  newChatProject: null,
+  newChatTitle: "",
+  newChatPrompt: "",
+  newChatMode: "workspace-write",
+  newChatEffort: "auto",
+  newChatWebSearch: false,
+  newChatSubmitting: false,
+  newChatError: null,
 };
 
 const toggleAuxPaneResultSchema = z.object({ isError: z.boolean().optional() }).passthrough();
@@ -249,8 +292,7 @@ function buildCompactSummary(detail: SessionDetail, turn?: TurnDetail): string {
   const lines: string[] = [];
 
   if (turn) {
-    const roundNo = turn.delegation_round ?? turn.round_index;
-    lines.push(str.summaryRoundHeading(roundNo));
+    lines.push(str.summaryRoundHeading(turn.round_index));
   } else {
     lines.push(str.summarySessionHeading(s.title));
   }
@@ -259,6 +301,14 @@ function buildCompactSummary(detail: SessionDetail, turn?: TurnDetail): string {
   lines.push(`- **${str.summaryWorkspace}**: \`${s.worktree_path || s.project_dir}\``);
   if (s.isolation_mode) {
     lines.push(`- **${str.summaryIsolation}**: ${isolationLabel(s.isolation_mode, loc)}`);
+  }
+  const model = targetTurn?.model || s.model;
+  if (model) {
+    lines.push(`- **Model**: \`${model}\``);
+  }
+  const effort = targetTurn?.effort || s.reasoning_effort;
+  if (effort) {
+    lines.push(`- **${str.summaryEffort}**: ${effortLabel(effort, loc)}`);
   }
   lines.push(`- **${str.summaryStatus}**: ${statusLabel(targetTurn ? targetTurn.status : s.status, loc)}`);
 
@@ -311,7 +361,10 @@ function showToast(msg: string): void {
   }, 2400);
 }
 
-function groupByProject(sessions: SessionSummary[]): Array<{
+function groupByProject(
+  sessions: SessionSummary[],
+  projects: ProjectEntry[] = [],
+): Array<{
   projectDir: string;
   projectName: string;
   items: SessionSummary[];
@@ -336,6 +389,21 @@ function groupByProject(sessions: SessionSummary[]): Array<{
     entry.items.push(s);
     if (s.status === "running") entry.hasRunning = true;
   }
+  for (const p of projects) {
+    const key = p.project_dir;
+    if (!key) continue;
+    const exists = Array.from(map.keys()).some(
+      (k) => k.toLowerCase() === key.toLowerCase(),
+    );
+    if (!exists) {
+      map.set(key, {
+        projectDir: key,
+        projectName: p.project_name || key,
+        items: [],
+        hasRunning: false,
+      });
+    }
+  }
   return Array.from(map.values());
 }
 
@@ -343,57 +411,70 @@ function renderSidebarList(): string {
   const loc = activeLocale();
   const str = getStrings(loc);
 
-  if (!state.sessionsDirExists) {
+  if (!state.sessionsDirExists && state.projects.length === 0) {
     return `<div class="empty-state"><strong>${escapeHtml(str.noSessionsDir)}</strong><span>${escapeHtml(state.sessionsDir)}</span></div>`;
   }
-  if (state.sessions.length === 0) {
+  if (state.sessions.length === 0 && state.projects.length === 0) {
     return `<div class="empty-state"><strong>${escapeHtml(state.query ? str.noMatchingSessions : str.noLocalSessions)}</strong></div>`;
   }
 
   const isSearching = state.query.trim().length > 0;
-  const groups = groupByProject(state.sessions);
+  const groups = groupByProject(state.sessions, state.projects);
 
   return groups
     .map((g) => {
       const expanded = isSearching || state.expandedGroups.has(g.projectDir);
       const itemsHtml = !expanded
         ? ""
-        : `<div class="group-items">${g.items
-            .map((s) => {
-              const active = s.session_id === state.selectedSessionId ? " active" : "";
-              const delegatedChip = s.is_delegated
-                ? `<span class="meta-chip delegated" title="${escapeHtml(str.delegatedByTip(s.source_model || "Gemini"))}">AGY</span>`
-                : "";
-              const modelChip = s.model
-                ? `<span class="meta-chip" title="${escapeHtml(s.model)}">${escapeHtml(s.model)}</span>`
-                : "";
-              const timeText = formatRelativeTime(s.updated_at, loc);
-              return `
-                <button class="session-item${active}" data-session-id="${escapeHtml(s.session_id)}" type="button">
-                  <div class="session-row-top">
-                    <span class="dot ${s.status}" aria-label="${escapeHtml(statusLabel(s.status, loc))}"></span>
-                    <span class="session-title">${escapeHtml(s.title)}</span>
-                  </div>
-                  <div class="session-meta">
-                    ${delegatedChip}
-                    ${modelChip}
-                    <span>${escapeHtml(str.roundsShort(s.round_count))}</span>
-                    <span class="meta-time">${escapeHtml(timeText)}</span>
-                  </div>
-                </button>`;
-            })
-            .join("")}</div>`;
+        : g.items.length === 0
+          ? `<div class="group-empty">${escapeHtml(str.emptyProjectHint)}</div>`
+          : `<div class="group-items">${g.items
+              .map((s) => {
+                const active = s.session_id === state.selectedSessionId ? " active" : "";
+                const delegatedChip = s.is_delegated
+                  ? `<span class="meta-chip delegated" title="${escapeHtml(str.delegatedByTip(s.source_model || "Gemini"))}">AGY</span>`
+                  : "";
+                const modelChip = s.model
+                  ? `<span class="meta-chip" title="${escapeHtml(s.model)}">${escapeHtml(s.model)}</span>`
+                  : "";
+                const effortChip = s.reasoning_effort
+                  ? `<span class="meta-chip effort-chip" title="${escapeHtml(`${str.reasoningEffortAria}: ${effortLabel(s.reasoning_effort, loc)}`)}">${escapeHtml(effortShortLabel(s.reasoning_effort, loc))}</span>`
+                  : "";
+                const timeText = formatRelativeTime(s.updated_at, loc);
+                return `
+                  <button class="session-item${active}" data-session-id="${escapeHtml(s.session_id)}" type="button">
+                    <div class="session-row-top">
+                      <span class="dot ${s.status}" aria-label="${escapeHtml(statusLabel(s.status, loc))}"></span>
+                      <span class="session-title">${escapeHtml(s.title)}</span>
+                    </div>
+                    <div class="session-meta">
+                      ${delegatedChip}
+                      ${modelChip}
+                      ${effortChip}
+                      <span>${escapeHtml(str.roundsShort(s.round_count))}</span>
+                      <span class="meta-time">${escapeHtml(timeText)}</span>
+                    </div>
+                  </button>`;
+              })
+              .join("")}</div>`;
 
       const runningDot = g.hasRunning ? `<span class="dot dot-inline running"></span>` : "";
+      const canCreateChat = Boolean(g.projectDir && g.projectDir !== "(Unknown Workspace)");
+      const newChatBtn = canCreateChat
+        ? `<button class="group-new-chat-btn" data-new-chat-dir="${escapeHtml(g.projectDir)}" data-new-chat-name="${escapeHtml(g.projectName)}" title="${escapeHtml(str.newChatInProject(g.projectName))}" aria-label="${escapeHtml(str.newChatInProject(g.projectName))}" type="button">+</button>`
+        : "";
 
       return `
         <div class="group-block">
-          <button class="group-header" data-group-dir="${escapeHtml(g.projectDir)}" title="${escapeHtml(g.projectDir)}" type="button" aria-expanded="${expanded}">
-            <span class="group-chevron">${expanded ? "▾" : "▸"}</span>
-            <span class="group-name">${escapeHtml(g.projectName)}</span>
-            ${runningDot}
-            <span class="group-count">${g.items.length}</span>
-          </button>
+          <div class="group-header-row">
+            <button class="group-header" data-group-dir="${escapeHtml(g.projectDir)}" title="${escapeHtml(g.projectDir)}" type="button" aria-expanded="${expanded}">
+              <span class="group-chevron">${expanded ? "▾" : "▸"}</span>
+              <span class="group-name">${escapeHtml(g.projectName)}</span>
+              ${runningDot}
+              <span class="group-count">${g.items.length}</span>
+            </button>
+            ${newChatBtn}
+          </div>
           ${itemsHtml}
         </div>`;
     })
@@ -454,6 +535,48 @@ function renderModelOptions(selectedSlug: string): string {
     .join("");
 }
 
+const ALL_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max", "ultra"];
+
+function getSupportedEfforts(modelSlug?: string | null): ReasoningEffort[] {
+  if (modelSlug) {
+    const found = state.availableModels.find((m) => m.slug === modelSlug);
+    if (found && found.efforts.length > 0) {
+      const valid = found.efforts.filter((e): e is ReasoningEffort =>
+        (ALL_EFFORTS as readonly string[]).includes(e),
+      );
+      if (valid.length > 0) return valid;
+    }
+  }
+  return ALL_EFFORTS;
+}
+
+function renderEffortOptions(
+  selected: ReasoningEffortSetting,
+  modelSlug?: string | null,
+  compactAuto = false,
+): string {
+  const loc = activeLocale();
+  const str = getStrings(loc);
+  const autoText = compactAuto
+    ? state.reasoningEffort !== "auto"
+      ? str.reasoningEffortAutoWithDefault(effortShortLabel(state.reasoningEffort, loc))
+      : str.reasoningEffortAutoShort
+    : str.reasoningEffortAuto;
+
+  const efforts = [...getSupportedEfforts(modelSlug)];
+  if (selected !== "auto" && !efforts.includes(selected)) {
+    efforts.push(selected);
+  }
+
+  return [
+    `<option value="auto"${selected === "auto" ? " selected" : ""}>${escapeHtml(autoText)}</option>`,
+    ...efforts.map((eff) => {
+      const label = compactAuto ? effortShortLabel(eff, loc) : effortLabel(eff, loc);
+      return `<option value="${escapeHtml(eff)}"${selected === eff ? " selected" : ""}>${escapeHtml(label)}</option>`;
+    }),
+  ].join("");
+}
+
 function renderSettingsPopover(): string {
   const loc = activeLocale();
   const str = getStrings(loc);
@@ -508,6 +631,10 @@ function renderSettingsPopover(): string {
         <label class="settings-field">
           <span>${escapeHtml(str.escalationModelLabel)}</span>
           <select id="sel-escalation-model" class="ctrl-select">${renderModelOptions(state.escalationModel)}</select>
+        </label>
+        <label class="settings-field">
+          <span>${escapeHtml(str.reasoningEffortLabel)}</span>
+          <select id="sel-default-effort" class="ctrl-select">${renderEffortOptions(state.reasoningEffort, state.defaultModel, false)}</select>
         </label>
         <div class="settings-inline-row">
           <label class="toggle-label">
@@ -656,6 +783,7 @@ function renderProfileOverviewPane(): string {
                 : `<span class="origin-pill direct">${escapeHtml(str.originTagDirect)}</span>`;
             const metaBits: string[] = [s.project_name];
             if (s.model) metaBits.push(s.model);
+            if (s.reasoning_effort) metaBits.push(effortShortLabel(s.reasoning_effort, loc));
             metaBits.push(str.roundsShort(s.round_count));
             if (s.total_tokens > 0) metaBits.push(`${formatCompactNumber(s.total_tokens, loc)} tok`);
             return `
@@ -836,7 +964,7 @@ function renderProfileOverviewPane(): string {
             </div>
             <div class="insight-row">
               <span class="insight-key">${escapeHtml(str.insightRoutingMode)}</span>
-              <span class="insight-val">${escapeHtml(routingModeLabel(state.routingMode, loc))}</span>
+              <span class="insight-val">${escapeHtml(state.reasoningEffort !== "auto" ? `${routingModeLabel(state.routingMode, loc)} · ${effortShortLabel(state.reasoningEffort, loc)}` : routingModeLabel(state.routingMode, loc))}</span>
             </div>
             ${worktreesHtml}
           </div>
@@ -905,8 +1033,7 @@ function renderFileChip(fc: FileChangeRecord): string {
 function renderTurnSection(turn: TurnDetail, isLatest: boolean, sessionId: string): string {
   const loc = activeLocale();
   const str = getStrings(loc);
-  const displayRound = turn.delegation_round ?? turn.round_index;
-  const roundLabel = str.roundTag(displayRound, turn.is_delegated);
+  const roundLabel = str.roundTag(turn.round_index, turn.is_delegated);
   const sourceBadge = turn.source_model
     ? `<span class="source-tag">${escapeHtml(turn.source_model)}</span>`
     : "";
@@ -916,6 +1043,9 @@ function renderTurnSection(turn: TurnDetail, isLatest: boolean, sessionId: strin
     : "";
 
   const modelMeta = turn.model ? `<span>${escapeHtml(turn.model)}</span>` : "";
+  const effortMeta = turn.effort
+    ? `<span class="effort-chip" title="${escapeHtml(`${str.reasoningEffortAria}: ${effortLabel(turn.effort, loc)}`)}">${escapeHtml(effortShortLabel(turn.effort, loc))}</span>`
+    : "";
   const durMeta = turn.duration_ms ? `<span>${formatDuration(turn.duration_ms)}</span>` : "";
 
   const canHandoff = state.canUpdateContext || state.canSendMessage;
@@ -991,8 +1121,12 @@ function renderTurnSection(turn: TurnDetail, isLatest: boolean, sessionId: strin
       ? `<div class="turn-files">${turn.changed_files.map(renderFileChip).join("")}</div>`
       : "";
 
-  const errorHtml = turn.error_reason
-    ? `<div class="error-banner">${escapeHtml(str.abortedPrefix + turn.error_reason)}</div>`
+  const errorText =
+    turn.error_code === "thread_writer_busy"
+      ? str.writerBusyHint
+      : turn.error_reason;
+  const errorHtml = errorText
+    ? `<div class="error-banner">${escapeHtml(str.abortedPrefix + errorText)}</div>`
     : "";
 
   return `
@@ -1007,6 +1141,7 @@ function renderTurnSection(turn: TurnDetail, isLatest: boolean, sessionId: strin
         <div class="turn-header-right">
           ${turnHandoffBtn}
           ${modelMeta}
+          ${effortMeta}
           ${durMeta}
         </div>
       </div>
@@ -1019,6 +1154,56 @@ function renderTurnSection(turn: TurnDetail, isLatest: boolean, sessionId: strin
         ${filesHtml}
       </div>
     </section>`;
+}
+
+function renderFollowupComposer(d: SessionDetail): string {
+  const loc = activeLocale();
+  const str = getStrings(loc);
+  const isRunning = d.summary.status === "running" || Boolean(d.summary.active_run_id);
+  const disabled = isRunning || state.sendingFollowup;
+  const canSend = !disabled && state.followupDraft.trim().length > 0;
+  const placeholder = state.sendingFollowup
+    ? str.followupSendingPlaceholder
+    : isRunning
+      ? str.followupRunningPlaceholder
+      : str.followupPlaceholder;
+
+  return `
+    <div class="followup-dock">
+      <div class="followup-box${disabled ? " disabled" : ""}">
+        <textarea
+          id="followup-input"
+          class="followup-input"
+          rows="1"
+          placeholder="${escapeHtml(placeholder)}"
+          aria-label="${escapeHtml(str.followupSendAria)}"
+          ${disabled ? "disabled" : ""}
+        >${escapeHtml(state.followupDraft)}</textarea>
+        <div class="followup-footer">
+          <div class="followup-footer-left">
+            <select
+              id="sel-followup-effort"
+              class="ctrl-select followup-effort-select"
+              aria-label="${escapeHtml(str.reasoningEffortAria)}"
+              title="${escapeHtml(str.reasoningEffortTip)}"
+              ${disabled ? "disabled" : ""}
+            >${renderEffortOptions(state.followupEffort, d.summary.model, true)}</select>
+            <label class="toggle-label followup-web-toggle" title="${escapeHtml(str.followupWebSearchTip)}">
+              <input id="chk-followup-web" type="checkbox" ${state.followupWebSearch ? "checked" : ""} ${disabled ? "disabled" : ""} />
+              <span>${escapeHtml(str.followupWebSearch)}</span>
+            </label>
+          </div>
+          <button
+            id="btn-send-followup"
+            class="followup-send-btn"
+            type="button"
+            aria-label="${escapeHtml(str.followupSendAria)}"
+            title="${escapeHtml(str.followupSendAria)}"
+            ${canSend ? "" : "disabled"}
+          >↑</button>
+        </div>
+      </div>
+    </div>`;
 }
 
 function renderSessionDetailPane(): string {
@@ -1077,6 +1262,10 @@ function renderSessionDetailPane(): string {
       ? `<div class="turn-list">${d.turns.map((t, idx) => renderTurnSection(t, idx === d.turns.length - 1, d.summary.session_id)).join("")}</div>`
       : `<div class="empty-state"><strong>${escapeHtml(str.emptySessionTurns)}</strong></div>`;
 
+  const effortPill = d.summary.reasoning_effort
+    ? `<span class="effort-pill" title="${escapeHtml(`${str.reasoningEffortAria}: ${effortLabel(d.summary.reasoning_effort, loc)}`)}">${escapeHtml(effortShortLabel(d.summary.reasoning_effort, loc))}</span>`
+    : "";
+
   return `
     ${renderTopbar()}
     <div class="detail-scroll" id="detail-scroll">
@@ -1089,6 +1278,7 @@ function renderSessionDetailPane(): string {
               <span class="dot dot-inline ${d.summary.status}"></span>
               <span>${escapeHtml(statusLabel(d.summary.status, loc))}</span>
             </span>
+            ${effortPill}
             <span class="metric">${escapeHtml(str.roundsLabel)} <strong>${d.turns.length}</strong></span>
             <span class="metric">${escapeHtml(str.commandsLabel)} <strong>${d.total_commands}</strong></span>
             <button class="metric-btn" id="btn-files-drawer" type="button">
@@ -1101,7 +1291,8 @@ function renderSessionDetailPane(): string {
         </div>
         ${turnsHtml}
       </div>
-    </div>`;
+    </div>
+    ${renderFollowupComposer(d)}`;
 }
 
 function renderMainPane(): string {
@@ -1125,6 +1316,178 @@ function updateSidebarChrome(): void {
   if (refreshBtn) {
     refreshBtn.title = str.refreshSessions;
     refreshBtn.setAttribute("aria-label", str.refreshSessions);
+  }
+  const newProjBtn = document.getElementById("btn-new-project");
+  if (newProjBtn) {
+    newProjBtn.title = str.newProject;
+    newProjBtn.setAttribute("aria-label", str.newProject);
+  }
+}
+
+function renderOrbitModal(): string {
+  const loc = activeLocale();
+  const str = getStrings(loc);
+
+  if (state.newProjectOpen) {
+    const errHtml = state.newProjectError
+      ? `<div class="orbit-modal-error">${escapeHtml(state.newProjectError)}</div>`
+      : "";
+    return `
+      <div id="orbit-modal-backdrop" class="orbit-modal-backdrop">
+        <div class="orbit-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(str.newProjectTitle)}">
+          <div class="orbit-modal-header">
+            <h3>${escapeHtml(str.newProjectTitle)}</h3>
+            <button id="btn-close-orbit-modal" class="icon-btn" type="button" aria-label="${escapeHtml(str.cancelBtn)}">×</button>
+          </div>
+          <div class="orbit-modal-body">
+            <label class="orbit-field">
+              <span>${escapeHtml(str.projectPathLabel)}</span>
+              <input id="new-project-dir-input" class="orbit-input" type="text" value="${escapeHtml(state.newProjectDir)}" placeholder="${escapeHtml(str.projectPathPlaceholder)}" autocomplete="off" />
+            </label>
+            <label class="orbit-check">
+              <input id="new-project-create-missing" type="checkbox"${state.newProjectCreateMissing ? " checked" : ""} />
+              <span>${escapeHtml(str.createDirIfMissing)}</span>
+            </label>
+            ${errHtml}
+          </div>
+          <div class="orbit-modal-footer">
+            <button id="btn-cancel-orbit-modal" class="btn-secondary" type="button">${escapeHtml(str.cancelBtn)}</button>
+            <button id="btn-submit-new-project" class="btn-primary" type="button"${state.newProjectSubmitting || !state.newProjectDir.trim() ? " disabled" : ""}>${escapeHtml(str.createProjectBtn)}</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  if (state.newChatProject) {
+    const errHtml = state.newChatError
+      ? `<div class="orbit-modal-error">${escapeHtml(state.newChatError)}</div>`
+      : "";
+    const modes: IsolationMode[] = ["workspace-write", "read-only", "worktree"];
+    const modeOptions = modes
+      .map(
+        (m) =>
+          `<option value="${m}"${state.newChatMode === m ? " selected" : ""}>${escapeHtml(isolationLabel(m, loc) || m)}</option>`,
+      )
+      .join("");
+    return `
+      <div id="orbit-modal-backdrop" class="orbit-modal-backdrop">
+        <div class="orbit-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(str.newChatTitle)}">
+          <div class="orbit-modal-header">
+            <div class="orbit-modal-title-wrap">
+              <h3>${escapeHtml(str.newChatTitle)}</h3>
+              <span class="orbit-modal-sub" title="${escapeHtml(state.newChatProject.projectDir)}">${escapeHtml(state.newChatProject.projectName)}</span>
+            </div>
+            <button id="btn-close-orbit-modal" class="icon-btn" type="button" aria-label="${escapeHtml(str.cancelBtn)}">×</button>
+          </div>
+          <div class="orbit-modal-body">
+            <label class="orbit-field">
+              <span>${escapeHtml(str.sessionTitleLabel)}</span>
+              <input id="new-chat-title-input" class="orbit-input" type="text" value="${escapeHtml(state.newChatTitle)}" placeholder="${escapeHtml(str.sessionTitlePlaceholder)}" autocomplete="off" />
+            </label>
+            <label class="orbit-field">
+              <span>${escapeHtml(str.sessionPromptLabel)}</span>
+              <textarea id="new-chat-prompt-input" class="orbit-textarea" rows="4" placeholder="${escapeHtml(str.sessionPromptPlaceholder)}">${escapeHtml(state.newChatPrompt)}</textarea>
+            </label>
+            <div class="orbit-modal-row">
+              <label class="orbit-field orbit-field-inline">
+                <span>${escapeHtml(str.sessionModeLabel)}</span>
+                <select id="new-chat-mode-select" class="ctrl-select">${modeOptions}</select>
+              </label>
+              <label class="orbit-field orbit-field-inline">
+                <span>${escapeHtml(str.reasoningEffortAria)}</span>
+                <select id="new-chat-effort-select" class="ctrl-select">${renderEffortOptions(state.newChatEffort, state.defaultModel, false)}</select>
+              </label>
+              <label class="orbit-check">
+                <input id="new-chat-web-search" type="checkbox"${state.newChatWebSearch ? " checked" : ""} />
+                <span>${escapeHtml(str.followupWebSearch)}</span>
+              </label>
+            </div>
+            ${errHtml}
+          </div>
+          <div class="orbit-modal-footer">
+            <button id="btn-cancel-orbit-modal" class="btn-secondary" type="button">${escapeHtml(str.cancelBtn)}</button>
+            <button id="btn-submit-new-chat" class="btn-primary" type="button"${state.newChatSubmitting || !state.newChatPrompt.trim() ? " disabled" : ""}>${escapeHtml(str.startChatBtn)}</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  return "";
+}
+
+function renderModalRoot(): void {
+  const root = document.getElementById("orbit-modal-root");
+  if (!root) return;
+  root.innerHTML = renderOrbitModal();
+}
+
+async function handleCreateProject(): Promise<void> {
+  if (!api || state.newProjectSubmitting) return;
+  const dir = state.newProjectDir.trim();
+  if (!dir) return;
+  const str = getStrings(activeLocale());
+  state.newProjectSubmitting = true;
+  state.newProjectError = null;
+  renderModalRoot();
+  try {
+    const res = await api.createProject(dir, state.newProjectCreateMissing);
+    if (!res.created || !res.project_dir) {
+      state.newProjectError = res.error || "Could not add project.";
+      return;
+    }
+    state.newProjectOpen = false;
+    state.newProjectDir = "";
+    state.expandedGroups.add(res.project_dir);
+    showToast(str.toastProjectCreated(res.project_name || res.project_dir));
+    await refreshSessions(false);
+  } catch (err) {
+    state.newProjectError = err instanceof Error ? err.message : String(err);
+  } finally {
+    state.newProjectSubmitting = false;
+    renderModalRoot();
+  }
+}
+
+async function handleCreateSession(): Promise<void> {
+  if (!api || !state.newChatProject || state.newChatSubmitting) return;
+  const prompt = state.newChatPrompt.trim();
+  if (!prompt) return;
+  const str = getStrings(activeLocale());
+  const projectDir = state.newChatProject.projectDir;
+  state.newChatSubmitting = true;
+  state.newChatError = null;
+  renderModalRoot();
+  try {
+    const res = await api.createSession(
+      projectDir,
+      prompt,
+      state.newChatTitle.trim(),
+      state.newChatMode,
+      state.newChatWebSearch,
+      state.newChatEffort,
+    );
+    if (!res.started || !res.run_id) {
+      state.newChatError = res.error || "Could not start conversation.";
+      return;
+    }
+    state.newChatProject = null;
+    state.newChatTitle = "";
+    state.newChatPrompt = "";
+    state.newChatEffort = "auto";
+    state.expandedGroups.add(projectDir);
+    state.autoFollow = true;
+    showToast(str.toastSessionStarted);
+    await refreshSessions(false);
+    const created = state.sessions.find(
+      (s) => s.active_run_id === res.run_id || s.session_id === res.run_id,
+    );
+    await selectSession(created?.session_id || res.run_id);
+    scheduleNextPoll();
+  } catch (err) {
+    state.newChatError = err instanceof Error ? err.message : String(err);
+  } finally {
+    state.newChatSubmitting = false;
+    renderModalRoot();
   }
 }
 
@@ -1230,19 +1593,66 @@ async function handleUiLocaleChange(nextLocale: UiLocale): Promise<void> {
   }
 }
 
+function applySettingsSnapshot(s: {
+  routing_mode?: RoutingMode;
+  ui_locale?: UiLocale;
+  default_model?: string;
+  escalation_model?: string;
+  reasoning_effort?: ReasoningEffortSetting;
+  quota_guardrail_enabled?: boolean;
+  quota_guardrail_threshold_pct?: number;
+  available_models?: ModelCatalogEntry[];
+}): void {
+  let localeChanged = false;
+  if (s.routing_mode && s.routing_mode !== state.routingMode) {
+    state.routingMode = s.routing_mode;
+    detailDirty = true;
+  }
+  if (s.ui_locale && s.ui_locale !== state.uiLocale) {
+    state.uiLocale = s.ui_locale;
+    localeChanged = true;
+    detailDirty = true;
+  }
+  if (s.default_model && s.default_model !== state.defaultModel) {
+    state.defaultModel = s.default_model;
+    detailDirty = true;
+  }
+  if (s.escalation_model && s.escalation_model !== state.escalationModel) {
+    state.escalationModel = s.escalation_model;
+    detailDirty = true;
+  }
+  if (s.reasoning_effort && s.reasoning_effort !== state.reasoningEffort) {
+    state.reasoningEffort = s.reasoning_effort;
+    detailDirty = true;
+  }
+  if (
+    typeof s.quota_guardrail_enabled === "boolean" &&
+    s.quota_guardrail_enabled !== state.quotaGuardrailEnabled
+  ) {
+    state.quotaGuardrailEnabled = s.quota_guardrail_enabled;
+    detailDirty = true;
+  }
+  if (
+    typeof s.quota_guardrail_threshold_pct === "number" &&
+    s.quota_guardrail_threshold_pct !== state.quotaGuardrailThresholdPct
+  ) {
+    state.quotaGuardrailThresholdPct = s.quota_guardrail_threshold_pct;
+    detailDirty = true;
+  }
+  if (s.available_models !== undefined) {
+    state.availableModels = s.available_models;
+    detailDirty = true;
+  }
+  if (localeChanged) {
+    applyLocaleToDocument();
+  }
+}
+
 async function refreshSettings(): Promise<void> {
   if (!api) return;
   try {
     const s = await api.getSettings();
-    state.routingMode = s.routing_mode;
-    state.uiLocale = s.ui_locale;
-    state.defaultModel = s.default_model;
-    state.escalationModel = s.escalation_model;
-    state.quotaGuardrailEnabled = s.quota_guardrail_enabled;
-    state.quotaGuardrailThresholdPct = s.quota_guardrail_threshold_pct;
-    state.availableModels = s.available_models ?? [];
-    applyLocaleToDocument();
-    detailDirty = true;
+    applySettingsSnapshot(s);
     render();
   } catch {
     // Non-fatal: keep defaults when host/tool call fails transiently.
@@ -1252,6 +1662,7 @@ async function refreshSettings(): Promise<void> {
 async function handleUpdateSettings(patch: {
   default_model?: string;
   escalation_model?: string;
+  reasoning_effort?: ReasoningEffortSetting;
   quota_guardrail_enabled?: boolean;
   quota_guardrail_threshold_pct?: number;
 }): Promise<void> {
@@ -1261,9 +1672,12 @@ async function handleUpdateSettings(patch: {
     const updated = await api.updateSettings(patch);
     state.defaultModel = updated.default_model;
     state.escalationModel = updated.escalation_model;
+    state.reasoningEffort = updated.reasoning_effort ?? state.reasoningEffort;
     state.quotaGuardrailEnabled = updated.quota_guardrail_enabled;
     state.quotaGuardrailThresholdPct = updated.quota_guardrail_threshold_pct;
     state.availableModels = updated.available_models ?? state.availableModels;
+    detailDirty = true;
+    render();
     showToast(str.toastSettingsSaved);
   } catch (err) {
     showToast(str.toastSwitchFailed(err instanceof Error ? err.message : String(err)));
@@ -1308,6 +1722,45 @@ async function handlePruneWorktrees(): Promise<void> {
   }
 }
 
+async function handleSendFollowup(): Promise<void> {
+  if (!api || !state.detail || state.sendingFollowup) return;
+  const text = state.followupDraft.trim();
+  if (!text) return;
+  const isRunning = state.detail.summary.status === "running" || Boolean(state.detail.summary.active_run_id);
+  if (isRunning) return;
+
+  const str = getStrings(activeLocale());
+  const sessionId = state.detail.summary.session_id;
+  state.sendingFollowup = true;
+  detailDirty = true;
+  render();
+
+  try {
+    const res = await api.sendFollowup(
+      sessionId,
+      text,
+      state.followupWebSearch,
+      state.followupEffort,
+    );
+    if (!res.started) {
+      showToast(str.toastFollowupFailed(res.error || "Unknown error"));
+      return;
+    }
+    state.followupDraft = "";
+    state.autoFollow = true;
+    showToast(str.toastFollowupStarted);
+    await pollActiveDetail();
+    await refreshSessions(false);
+    scheduleNextPoll();
+  } catch (err) {
+    showToast(str.toastFollowupFailed(err instanceof Error ? err.message : String(err)));
+  } finally {
+    state.sendingFollowup = false;
+    detailDirty = true;
+    render(state.autoFollow);
+  }
+}
+
 function openOverview(): void {
   state.selectedSessionId = null;
   state.detail = null;
@@ -1341,11 +1794,13 @@ function mountShell(): void {
         </div>
         <div class="sidebar-top">
           <input id="search-input" class="search-input" type="search" placeholder="${escapeHtml(str.searchPlaceholder)}" autocomplete="off" />
+          <button id="btn-new-project" class="icon-btn" type="button" title="${escapeHtml(str.newProject)}" aria-label="${escapeHtml(str.newProject)}">+</button>
           <button id="btn-refresh" class="icon-btn" type="button" title="${escapeHtml(str.refreshSessions)}" aria-label="${escapeHtml(str.refreshSessions)}">↻</button>
         </div>
         <div id="session-groups" class="session-groups"></div>
       </aside>
       <main id="main-pane" class="main"></main>
+      <div id="orbit-modal-root"></div>
     </div>`;
 
   document.getElementById("btn-nav-home")?.addEventListener("click", () => {
@@ -1366,9 +1821,37 @@ function mountShell(): void {
     if (!state.selectedSessionId) void refreshProfileOverview();
   });
 
+  document.getElementById("btn-new-project")?.addEventListener("click", () => {
+    state.newChatProject = null;
+    state.newProjectOpen = true;
+    state.newProjectError = null;
+    if (!state.newProjectDir && state.preferredWorkspace) {
+      state.newProjectDir = state.preferredWorkspace;
+    }
+    renderModalRoot();
+    window.setTimeout(() => {
+      document.getElementById("new-project-dir-input")?.focus();
+    }, 0);
+  });
+
   document.getElementById("session-groups")?.addEventListener("click", (ev) => {
     const target = ev.target as HTMLElement | null;
     if (!target) return;
+    const newChatBtn = target.closest<HTMLElement>("[data-new-chat-dir]");
+    if (newChatBtn) {
+      const dir = newChatBtn.dataset.newChatDir || "";
+      const name = newChatBtn.dataset.newChatName || dir;
+      if (dir) {
+        state.newProjectOpen = false;
+        state.newChatProject = { projectDir: dir, projectName: name };
+        state.newChatError = null;
+        renderModalRoot();
+        window.setTimeout(() => {
+          document.getElementById("new-chat-prompt-input")?.focus();
+        }, 0);
+      }
+      return;
+    }
     const groupBtn = target.closest<HTMLElement>("[data-group-dir]");
     if (groupBtn) {
       const dir = groupBtn.dataset.groupDir || "";
@@ -1461,6 +1944,10 @@ function mountShell(): void {
     }
     if (target.closest("#btn-prune-worktrees")) {
       void handlePruneWorktrees();
+      return;
+    }
+    if (target.closest("#btn-send-followup")) {
+      void handleSendFollowup();
       return;
     }
     if (target.closest("#btn-clear-date")) {
@@ -1570,6 +2057,14 @@ function mountShell(): void {
       void handleUpdateSettings({ escalation_model: target.value });
       return;
     }
+    if (target.id === "sel-default-effort") {
+      const val = target.value as ReasoningEffortSetting;
+      state.reasoningEffort = val;
+      detailDirty = true;
+      render();
+      void handleUpdateSettings({ reasoning_effort: val });
+      return;
+    }
     if (target.id === "chk-guardrail" && "checked" in target) {
       state.quotaGuardrailEnabled = target.checked;
       detailDirty = true;
@@ -1583,6 +2078,42 @@ function mountShell(): void {
         state.quotaGuardrailThresholdPct = val;
         void handleUpdateSettings({ quota_guardrail_threshold_pct: val });
       }
+      return;
+    }
+    if (target.id === "sel-followup-effort") {
+      state.followupEffort = target.value as ReasoningEffortSetting;
+      return;
+    }
+    if (target.id === "chk-followup-web" && "checked" in target) {
+      state.followupWebSearch = target.checked;
+    }
+  });
+
+  document.getElementById("main-pane")?.addEventListener("input", (ev) => {
+    const target = ev.target as HTMLTextAreaElement | null;
+    if (target?.id === "followup-input") {
+      state.followupDraft = target.value;
+      target.style.height = "auto";
+      target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
+      const sendBtn = document.getElementById("btn-send-followup") as HTMLButtonElement | null;
+      if (sendBtn) {
+        const isRunning =
+          state.detail?.summary.status === "running" || Boolean(state.detail?.summary.active_run_id);
+        sendBtn.disabled = isRunning || state.sendingFollowup || !state.followupDraft.trim();
+      }
+    }
+  });
+
+  document.getElementById("main-pane")?.addEventListener("keydown", (ev) => {
+    const target = ev.target as HTMLTextAreaElement | null;
+    if (
+      target?.id === "followup-input" &&
+      ev.key === "Enter" &&
+      !ev.shiftKey &&
+      !ev.isComposing
+    ) {
+      ev.preventDefault();
+      void handleSendFollowup();
     }
   });
 
@@ -1598,10 +2129,85 @@ function mountShell(): void {
   });
 
   document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape" && state.settingsOpen) {
-      state.settingsOpen = false;
-      detailDirty = true;
-      render();
+    if (ev.key === "Escape") {
+      if (state.newProjectOpen || state.newChatProject) {
+        state.newProjectOpen = false;
+        state.newChatProject = null;
+        renderModalRoot();
+        return;
+      }
+      if (state.settingsOpen) {
+        state.settingsOpen = false;
+        detailDirty = true;
+        render();
+      }
+    }
+  });
+
+  const modalRoot = document.getElementById("orbit-modal-root");
+  modalRoot?.addEventListener("click", (ev) => {
+    const target = ev.target as HTMLElement | null;
+    if (!target) return;
+    if (
+      target.id === "orbit-modal-backdrop" ||
+      target.closest("#btn-close-orbit-modal") ||
+      target.closest("#btn-cancel-orbit-modal")
+    ) {
+      state.newProjectOpen = false;
+      state.newChatProject = null;
+      renderModalRoot();
+      return;
+    }
+    if (target.closest("#btn-submit-new-project")) {
+      void handleCreateProject();
+      return;
+    }
+    if (target.closest("#btn-submit-new-chat")) {
+      void handleCreateSession();
+    }
+  });
+  modalRoot?.addEventListener("input", (ev) => {
+    const target = ev.target as HTMLInputElement | HTMLTextAreaElement | null;
+    if (!target) return;
+    if (target.id === "new-project-dir-input") {
+      state.newProjectDir = target.value;
+      const btn = document.getElementById("btn-submit-new-project") as HTMLButtonElement | null;
+      if (btn) btn.disabled = state.newProjectSubmitting || !state.newProjectDir.trim();
+    } else if (target.id === "new-chat-title-input") {
+      state.newChatTitle = target.value;
+    } else if (target.id === "new-chat-prompt-input") {
+      state.newChatPrompt = target.value;
+      const btn = document.getElementById("btn-submit-new-chat") as HTMLButtonElement | null;
+      if (btn) btn.disabled = state.newChatSubmitting || !state.newChatPrompt.trim();
+    }
+  });
+  modalRoot?.addEventListener("change", (ev) => {
+    const target = ev.target as HTMLInputElement | HTMLSelectElement | null;
+    if (!target) return;
+    if (target.id === "new-project-create-missing") {
+      state.newProjectCreateMissing = (target as HTMLInputElement).checked;
+    } else if (target.id === "new-chat-mode-select") {
+      state.newChatMode = target.value as IsolationMode;
+    } else if (target.id === "new-chat-effort-select") {
+      state.newChatEffort = target.value as ReasoningEffortSetting;
+    } else if (target.id === "new-chat-web-search") {
+      state.newChatWebSearch = (target as HTMLInputElement).checked;
+    }
+  });
+  modalRoot?.addEventListener("keydown", (ev) => {
+    const target = ev.target as HTMLElement | null;
+    if (!target) return;
+    if (target.id === "new-project-dir-input" && ev.key === "Enter" && !ev.isComposing) {
+      ev.preventDefault();
+      void handleCreateProject();
+    } else if (
+      target.id === "new-chat-prompt-input" &&
+      ev.key === "Enter" &&
+      !ev.shiftKey &&
+      !ev.isComposing
+    ) {
+      ev.preventDefault();
+      void handleCreateSession();
     }
   });
 }
@@ -1635,6 +2241,10 @@ function render(scrollBottom = false): void {
     const prevHmScrollEl = document.querySelector<HTMLElement>(".hm-scroll");
     const prevHmScrollLeft = prevHmScrollEl ? prevHmScrollEl.scrollLeft : null;
     const openFoldKeys = new Set<string>();
+    const activeEl = document.activeElement as HTMLTextAreaElement | null;
+    const wasFollowupFocused = activeEl?.id === "followup-input";
+    const selStart = wasFollowupFocused ? activeEl.selectionStart : null;
+    const selEnd = wasFollowupFocused ? activeEl.selectionEnd : null;
     if (mainEl) {
       mainEl.querySelectorAll<HTMLDetailsElement>("details[data-fold-key][open]").forEach((el) => {
         if (el.dataset.foldKey) openFoldKeys.add(el.dataset.foldKey);
@@ -1646,6 +2256,19 @@ function render(scrollBottom = false): void {
             el.open = true;
           }
         });
+      }
+      const nextFollowup = document.getElementById("followup-input") as HTMLTextAreaElement | null;
+      if (nextFollowup) {
+        if (state.followupDraft) {
+          nextFollowup.style.height = "auto";
+          nextFollowup.style.height = `${Math.min(nextFollowup.scrollHeight, 120)}px`;
+        }
+        if (wasFollowupFocused && !nextFollowup.disabled) {
+          nextFollowup.focus();
+          if (selStart !== null && selEnd !== null) {
+            nextFollowup.setSelectionRange(selStart, selEnd);
+          }
+        }
       }
     }
     detailDirty = false;
@@ -1699,6 +2322,7 @@ async function selectSession(sessionId: string): Promise<void> {
   if (!api) return;
   state.selectedSessionId = sessionId;
   state.showFilesDrawer = false;
+  state.followupEffort = "auto";
   state.loadingDetail = true;
   state.detailMetaTs = "";
 
@@ -1733,50 +2357,33 @@ async function selectSession(sessionId: string): Promise<void> {
   }
 }
 
+function applySessionsSnapshot(res: {
+  sessions: SessionSummary[];
+  projects?: ProjectEntry[];
+  sessions_dir: string;
+  sessions_dir_exists: boolean;
+}): { prevRunningIds: Set<string>; newlyRunning: SessionSummary[] } {
+  const prevRunningIds = state.seenRunningIds;
+  const nextRunning = res.sessions.filter((s) => s.status === "running");
+  const newlyRunning = nextRunning.filter((s) => !prevRunningIds.has(s.session_id));
+
+  state.sessions = res.sessions;
+  state.projects = res.projects ?? [];
+  state.sessionsDir = res.sessions_dir;
+  state.sessionsDirExists = res.sessions_dir_exists;
+  state.seenRunningIds = new Set(nextRunning.map((s) => s.session_id));
+  state.syncState = "live";
+  state.syncError = null;
+  listDirty = true;
+  return { prevRunningIds, newlyRunning };
+}
+
 async function refreshSessions(forceDetailPoll: boolean): Promise<void> {
   if (!api) return;
   try {
     const res = await api.listSessions(state.query, 100);
-    const prevRunningIds = state.seenRunningIds;
-    const nextRunning = res.sessions.filter((s) => s.status === "running");
-    const newlyRunning = nextRunning.filter((s) => !prevRunningIds.has(s.session_id));
-
-    state.sessions = res.sessions;
-    state.sessionsDir = res.sessions_dir;
-    state.sessionsDirExists = res.sessions_dir_exists;
-    state.seenRunningIds = new Set(nextRunning.map((s) => s.session_id));
-
-    if (res.routing_mode && res.routing_mode !== state.routingMode) {
-      state.routingMode = res.routing_mode;
-      detailDirty = true;
-    }
-    if (res.ui_locale && res.ui_locale !== state.uiLocale) {
-      state.uiLocale = res.ui_locale;
-      applyLocaleToDocument();
-      detailDirty = true;
-    }
-    if (res.default_model && res.default_model !== state.defaultModel) {
-      state.defaultModel = res.default_model;
-      detailDirty = true;
-    }
-    if (res.escalation_model && res.escalation_model !== state.escalationModel) {
-      state.escalationModel = res.escalation_model;
-      detailDirty = true;
-    }
-    if (typeof res.quota_guardrail_enabled === "boolean" && res.quota_guardrail_enabled !== state.quotaGuardrailEnabled) {
-      state.quotaGuardrailEnabled = res.quota_guardrail_enabled;
-      detailDirty = true;
-    }
-    if (
-      typeof res.quota_guardrail_threshold_pct === "number" &&
-      res.quota_guardrail_threshold_pct !== state.quotaGuardrailThresholdPct
-    ) {
-      state.quotaGuardrailThresholdPct = res.quota_guardrail_threshold_pct;
-      detailDirty = true;
-    }
-    state.syncState = "live";
-    state.syncError = null;
-    listDirty = true;
+    const { prevRunningIds, newlyRunning } = applySessionsSnapshot(res);
+    applySettingsSnapshot(res);
 
     // Auto-latch onto a running session when focus_running was requested
     // or when a brand-new running task starts while viewing the right aux pane.
@@ -1918,7 +2525,11 @@ function scheduleNextPoll(): void {
   const activeRunning =
     state.detail?.summary.status === "running" ||
     state.sessions.some((s) => s.status === "running");
-  const delayMs = state.focusRunningPending ? 800 : activeRunning ? 1500 : 3000;
+  const delayMs = state.focusRunningPending
+    ? (state.focusRunningTicks < 5 ? 400 : 800)
+    : activeRunning
+      ? 1500
+      : 3000;
   pollTimer = window.setTimeout(() => {
     void runPollTick();
   }, delayMs);
@@ -2002,7 +2613,7 @@ async function boot(): Promise<void> {
   mountShell();
   render();
 
-  const app = new App({ name: "Codex Orbit", version: "0.7.0" }, {});
+  const app = new App({ name: "Codex Orbit", version: "0.1.0" }, {});
   appInstance = app;
   api = new OrbitApi(app);
 
@@ -2057,22 +2668,54 @@ async function boot(): Promise<void> {
   state.canSendMessage = Boolean(caps?.message);
   state.canUpdateContext = Boolean(caps?.updateModelContext);
 
-  await refreshSessions(false);
+  const includeOverview = !state.selectedSessionId && !state.focusRunningPending;
+  let bootQuotaStale = false;
+  let bootHasQuota = false;
+  try {
+    const res = await api.bootstrap(
+      state.query,
+      100,
+      includeOverview,
+      state.overviewProjectFilter,
+    );
+    applySessionsSnapshot(res);
+    applySettingsSnapshot(res.settings);
+    if (res.quota) {
+      state.quota = res.quota;
+      bootHasQuota = true;
+      detailDirty = true;
+    }
+    bootQuotaStale = Boolean(res.quota_stale);
+    if (res.overview) {
+      state.overview = res.overview;
+      detailDirty = true;
+    }
+    render();
+  } catch (err) {
+    state.syncState = "error";
+    state.syncError = err instanceof Error ? err.message : String(err);
+    detailDirty = true;
+    render();
+  }
+
   if (state.selectedSessionId) {
     await selectSession(state.selectedSessionId);
   } else if (isAuxPaneSurface()) {
     const activeRunning = findBestRunningSession(state.sessions, state.preferredWorkspace);
     if (activeRunning) {
       state.focusRunningPending = false;
+      state.focusRunningTicks = 0;
       await selectSession(activeRunning.session_id);
-    } else {
-      await refreshProfileOverview();
+    } else if (!state.overview) {
+      render();
     }
-  } else {
-    await refreshProfileOverview();
+  } else if (!state.overview) {
+    render();
   }
-  void refreshQuota(false);
-  void refreshSettings();
+
+  if (bootQuotaStale || !bootHasQuota) {
+    void refreshQuota(false);
+  }
   scheduleNextPoll();
 }
 

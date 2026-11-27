@@ -7,11 +7,17 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
+from server import codex_desktop
 from server.codex_desktop import (
     ensure_codex_project_and_bind,
     format_agy_title,
     query_codex_quota,
+    read_cached_codex_quota,
+    read_rollout_fallback_quota_status,
     set_codex_thread_name,
+    write_cached_codex_quota,
 )
 
 
@@ -192,7 +198,7 @@ def test_ensure_codex_project_degrades_gracefully_on_schema_drift(tmp_path: Path
     assert (codex_home / ".codex-global-state.json").read_text(encoding="utf-8") == '{"local-projects": "unexpected-type"}'
 
 
-def test_set_thread_name_fallback_and_quota_rollout_fallback(tmp_path: Path) -> None:
+def test_set_thread_name_fallback_and_quota_rollout_fallback(tmp_path: Path, monkeypatch) -> None:
     codex_home = _init_fake_codex_home(tmp_path)
     res = set_codex_thread_name("sess-1", "后端权限重构", codex_home=codex_home, use_rpc=False)
     assert res["title"] == "agy: 后端权限重构"
@@ -225,9 +231,113 @@ def test_set_thread_name_fallback_and_quota_rollout_fallback(tmp_path: Path) -> 
         encoding="utf-8",
     )
 
-    quota = query_codex_quota(codex_bin=tmp_path / "missing-codex.exe", codex_home=codex_home)
+    data_dir = tmp_path / "data"
+    quota = query_codex_quota(codex_bin=tmp_path / "missing-codex.exe", codex_home=codex_home, data_dir=data_dir)
     assert quota["codex"]["available"] is True
     assert quota["codex"]["source"] == "rollout_cache"
     assert quota["codex"]["primary"]["remaining_percent"] == 85.0
     assert quota["codex"]["secondary"]["remaining_percent"] == 77.5
     assert quota["antigravity"]["available"] is False
+    assert not (data_dir / "quota_cache.json").exists()
+
+    def unexpected_binary_lookup(*args, **kwargs):
+        pytest.fail("Rollout fallback must not locate or launch Codex.")
+
+    monkeypatch.setattr(codex_desktop, "locate_codex_binary", unexpected_binary_lookup)
+    fallback = read_rollout_fallback_quota_status(str(codex_home))
+    assert fallback is not None
+    assert fallback["codex"]["source"] == "rollout_cache"
+    assert fallback["codex"]["primary"]["remaining_percent"] == 85.0
+    assert fallback["antigravity"] == quota["antigravity"]
+    assert read_rollout_fallback_quota_status(tmp_path / "missing-home") is None
+
+
+def test_quota_disk_cache_freshness_and_unavailable_write(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("CODEX_ORBIT_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(codex_desktop.time, "time", lambda: 400.0)
+    data = {"codex": {"available": True, "source": "app_server"}, "antigravity": {"available": False}}
+
+    write_cached_codex_quota({"codex": {"available": False}})
+    path = data_dir / "quota_cache.json"
+    assert not path.exists()
+    write_cached_codex_quota(data)
+    assert json.loads(path.read_text(encoding="utf-8")) == {"fetched_at": 400.0, "data": data}
+    assert read_cached_codex_quota(data_dir=str(data_dir)) == (data, True)
+
+    monkeypatch.setattr(codex_desktop.time, "time", lambda: 460.0)
+    write_cached_codex_quota({"codex": {"available": False}})
+    assert read_cached_codex_quota() == (data, True)
+    assert read_cached_codex_quota(max_age_seconds=59.0) is None
+
+    monkeypatch.setattr(codex_desktop.time, "time", lambda: 461.0)
+    assert read_cached_codex_quota() is None
+    assert read_cached_codex_quota(allow_stale=True) == (data, False)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "bad JSON",
+        "[]",
+        '{"fetched_at": "invalid", "data": {"codex": {"available": true}}}',
+        '{"fetched_at": true, "data": {"codex": {"available": true}}}',
+        '{"fetched_at": NaN, "data": {"codex": {"available": true}}}',
+        '{"fetched_at": 123, "data": {"codex": {"available": false}}}',
+        '{"fetched_at": 123, "data": {"codex": []}}',
+    ],
+)
+def test_quota_disk_cache_ignores_invalid_entries(tmp_path: Path, payload: str) -> None:
+    (tmp_path / "quota_cache.json").write_text(payload, encoding="utf-8")
+    assert read_cached_codex_quota(data_dir=tmp_path, allow_stale=True) is None
+
+
+def test_quota_query_uses_fresh_disk_cache_and_replaces_it_after_live_query(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / "data"
+    codex_home = tmp_path / "codex-home"
+    binary = tmp_path / "codex"
+    calls = []
+    monkeypatch.setattr(codex_desktop, "locate_codex_binary", lambda explicit: binary)
+
+    def read_rate_limits(codex_bin, method, params, *, timeout, codex_home):
+        assert codex_bin == binary
+        assert method == "account/rateLimits/read"
+        calls.append(codex_home)
+        return {"rateLimits": {"primary": {"usedPercent": 10 * len(calls)}}}
+
+    monkeypatch.setattr(codex_desktop, "_call_app_server_rpc", read_rate_limits)
+    monkeypatch.setattr(codex_desktop.time, "time", lambda: 100.0)
+
+    first = query_codex_quota(codex_home=codex_home, data_dir=data_dir, use_cache=True)
+    assert first["codex"]["primary"]["remaining_percent"] == 90.0
+    assert read_cached_codex_quota(data_dir=data_dir) == (first, True)
+    assert query_codex_quota(codex_home=codex_home, data_dir=data_dir, use_cache=True) == first
+    assert calls == [codex_home]
+
+    second = query_codex_quota(codex_home=codex_home, data_dir=data_dir)
+    assert second["codex"]["primary"]["remaining_percent"] == 80.0
+    assert calls == [codex_home, codex_home]
+    assert read_cached_codex_quota(data_dir=data_dir) == (second, True)
+
+    monkeypatch.setattr(codex_desktop.time, "time", lambda: 130.0)
+    third = query_codex_quota(codex_home=codex_home, data_dir=data_dir, use_cache=True, max_age_seconds=10)
+    assert third["codex"]["primary"]["remaining_percent"] == 70.0
+    assert calls == [codex_home, codex_home, codex_home]
+
+
+def test_quota_query_keeps_live_result_when_cache_write_fails(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / "data"
+    previous = {"codex": {"available": True}}
+    write_cached_codex_quota(previous, data_dir=data_dir)
+
+    def replace(source, destination):
+        raise PermissionError("quota cache replacement failed")
+
+    monkeypatch.setattr(codex_desktop.os, "replace", replace)
+    monkeypatch.setattr(codex_desktop, "locate_codex_binary", lambda explicit: tmp_path / "codex")
+    monkeypatch.setattr(codex_desktop, "_call_app_server_rpc", lambda *args, **kwargs: {})
+
+    quota = query_codex_quota(data_dir=data_dir)
+    assert quota["codex"]["source"] == "app_server"
+    assert read_cached_codex_quota(data_dir=data_dir) == (previous, True)
+    assert list(data_dir.iterdir()) == [data_dir / "quota_cache.json"]

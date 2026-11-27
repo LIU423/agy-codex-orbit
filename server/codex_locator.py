@@ -49,6 +49,7 @@ def _discover_windows_appx_codex() -> list[Path]:
             errors="replace",
             timeout=5,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if proc.returncode == 0:
             for line in proc.stdout.splitlines():
@@ -182,6 +183,7 @@ def probe_codex_version(binary: Path) -> str | None:
             errors="replace",
             timeout=5,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0,
         )
         if proc.returncode == 0:
             line = (proc.stdout or proc.stderr).strip().splitlines()

@@ -110,7 +110,7 @@ import os
 import sys
 
 initialize = json.loads(sys.stdin.readline())
-assert initialize["params"]["clientInfo"]["version"] == "0.7.0"
+assert initialize["params"]["clientInfo"]["version"] == "0.1.0"
 print(json.dumps({"id": initialize["id"], "result": {}}), flush=True)
 assert json.loads(sys.stdin.readline())["method"] == "initialized"
 request = json.loads(sys.stdin.readline())

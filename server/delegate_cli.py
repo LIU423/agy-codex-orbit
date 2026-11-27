@@ -46,6 +46,8 @@ from server.process_control import terminate_process_tree
 from server.routing_policy import (
     DEFAULT_ROUTING_MODE,
     ROUTING_MODE_LABELS,
+    VALID_EFFORTS,
+    VALID_REASONING_EFFORT_SETTINGS,
     VALID_ROUTING_MODES,
     VALID_TASK_TIERS,
     OrbitSettings,
@@ -57,9 +59,13 @@ from server.routing_policy import (
     save_settings,
 )
 
-VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 MAX_FINAL_SUMMARY_CHARS = 1800
 MAX_ERROR_CHARS = 600
+THREAD_WRITER_CONFLICT_MARKERS = ("already has an active writer", "thread-store conflict")
+THREAD_WRITER_BUSY_SUMMARY = (
+    "Thread is currently open in Codex Desktop (active writer conflict). "
+    "Continue there or close/unload the thread in Codex Desktop, then retry."
+)
 MAX_CHANGED_FILES = 60
 DEFAULT_POST_TURN_GRACE_SECONDS = 15.0
 
@@ -250,7 +256,7 @@ def _parse_json_event(
             msg = err.get("message") or json.dumps(err, ensure_ascii=False)
         else:
             msg = str(err or "Codex turn failed")
-        state["error"] = _clip(msg, MAX_ERROR_CHARS)
+        state["error"] = str(msg).strip()
         if ev_type == "turn.failed":
             state["turn_failed"] = True
             if state["turn_finished_mono"] is None:
@@ -288,6 +294,7 @@ def _resolve_settings_route(
     task_tier: TaskTier,
     isolation_mode: str,
     quota_remaining_5h: float | None = None,
+    reasoning_effort_override: str | None = None,
 ) -> RouteDecision:
     return resolve_route(
         routing_mode=routing_mode,
@@ -298,23 +305,26 @@ def _resolve_settings_route(
         quota_remaining_5h=quota_remaining_5h,
         quota_guardrail_enabled=settings.quota_guardrail_enabled,
         quota_guardrail_threshold_pct=settings.quota_guardrail_threshold_pct,
+        reasoning_effort_override=reasoning_effort_override or settings.reasoning_effort,
     )
 
 
-def _plan_route(args: argparse.Namespace, settings: OrbitSettings) -> dict[str, Any]:
+def _plan_route(args: argparse.Namespace, settings: OrbitSettings, store: DelegationStore) -> dict[str, Any]:
     active_mode: RoutingMode = args.routing_mode or settings.routing_mode
     tier: TaskTier = args.task_tier or "standard"
     remaining = args.quota_remaining_5h
-    decision = _resolve_settings_route(settings, active_mode, tier, args.mode, remaining)
+    decision = _resolve_settings_route(settings, active_mode, tier, args.mode, remaining, args.reasoning_effort)
     quota = None
     if remaining is None and (
         decision.requires_confirmation
         or (active_mode == "silent_best" and settings.quota_guardrail_enabled and tier in ("standard", "complex"))
     ):
-        quota = query_codex_quota(codex_bin=args.codex_bin)
+        quota = query_codex_quota(
+            codex_bin=args.codex_bin, data_dir=store.data_dir, use_cache=True, max_age_seconds=60.0,
+        )
         remaining = _remaining_5h(quota)
         if remaining is not None:
-            decision = _resolve_settings_route(settings, active_mode, tier, args.mode, remaining)
+            decision = _resolve_settings_route(settings, active_mode, tier, args.mode, remaining, args.reasoning_effort)
     elif decision.guardrail_triggered:
         quota = {
             "codex": {
@@ -338,17 +348,19 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         result = prune_idle_worktrees(DelegationStore(data_dir=args.data_dir))
         return (1 if result["errors"] else 0), result
 
+    store = DelegationStore(data_dir=args.data_dir)
     new_settings = {
         "default_model": args.set_default_model,
         "escalation_model": args.set_escalation_model,
+        "reasoning_effort": args.set_reasoning_effort,
         "quota_guardrail_enabled": None if args.set_quota_guardrail is None else args.set_quota_guardrail == "on",
         "quota_guardrail_threshold_pct": args.set_quota_threshold,
     }
     updates = {key: value for key, value in new_settings.items() if value is not None}
     if updates or args.set_routing_mode is not None:
-        settings = save_settings(args.data_dir, routing_mode=args.set_routing_mode, **updates)
+        settings = save_settings(store.data_dir, routing_mode=args.set_routing_mode, **updates)
     else:
-        settings = load_settings(args.data_dir)
+        settings = load_settings(store.data_dir)
 
     if args.get_settings or updates:
         return 0, settings.to_dict()
@@ -358,24 +370,44 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         return 0, {"routing_mode": active, "routing_mode_label": ROUTING_MODE_LABELS[active]}
 
     if args.plan_route:
-        return 0, _plan_route(args, settings)
+        return 0, _plan_route(args, settings, store)
 
     if args.check_quota:
         quota = query_codex_quota(codex_bin=args.codex_bin)
         return 0, quota
 
-    store = DelegationStore(data_dir=args.data_dir)
     existing_rec = store.get_by_session_id(args.session_id, verify_liveness=False) if args.session_id else None
     reserved_round = None
     if args.run_id:
+        if args.session_id is None:
+            existing_rec = store.get_by_run_id(args.run_id)
         if existing_rec and existing_rec.session_id == args.session_id:
             reserved_round = next((rnd for rnd in existing_rec.rounds if rnd.run_id == args.run_id), None)
         if reserved_round is None or reserved_round.status != "running" or reserved_round.pid is not None:
             return 2, {"status": "failed", "error": "No pending round for this run and session."}
-        store.update_round(args.run_id, pid=os.getpid())
+
+    isolation_mode: IsolationMode = args.mode
+    if args.session_id and existing_rec is not None and not args.mode_explicit:
+        isolation_mode = existing_rec.isolation_mode
+    routing_mode: RoutingMode = args.routing_mode or settings.routing_mode
+    task_tier: TaskTier = args.task_tier or "standard"
+    route = _resolve_settings_route(
+        settings, routing_mode, task_tier, isolation_mode, reasoning_effort_override=args.reasoning_effort,
+    )
+    if args.confirm_if_needed and not args.dry_run and args.model is None and route.requires_confirmation:
+        quota = query_codex_quota(
+            codex_bin=args.codex_bin, data_dir=store.data_dir, use_cache=True, max_age_seconds=60.0,
+        )
+        route = _resolve_settings_route(
+            settings, routing_mode, task_tier, isolation_mode, _remaining_5h(quota), args.reasoning_effort,
+        )
+        return 0, {"status": "needs_confirmation", **route.to_dict(), "quota": quota}
+
+    if reserved_round is not None:
+        store.update_round(reserved_round.run_id, pid=os.getpid())
 
     try:
-        code, summary = _execute_delegation(args, settings, store, existing_rec, reserved_round)
+        code, summary = _execute_delegation(args, settings, store, existing_rec, reserved_round, isolation_mode, route)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         if reserved_round is None:
             raise
@@ -394,6 +426,8 @@ def _execute_delegation(
     store: DelegationStore,
     existing_rec: DelegationSessionRecord | None,
     reserved_round: DelegationRoundRecord | None,
+    isolation_mode: IsolationMode,
+    route: RouteDecision,
 ) -> tuple[int, dict[str, Any]]:
     prompt = _read_prompt(args)
     if not prompt:
@@ -409,13 +443,6 @@ def _execute_delegation(
     if not workspace_dir.is_dir():
         return 2, {"status": "failed", "error": f"Workspace directory does not exist: {workspace_dir}"}
 
-    isolation_mode: IsolationMode = args.mode
-    if args.session_id and existing_rec is not None and not args.mode_explicit:
-        isolation_mode = existing_rec.isolation_mode
-
-    active_routing_mode: RoutingMode = args.routing_mode or settings.routing_mode
-    task_tier: TaskTier = args.task_tier or "standard"
-
     if args.title:
         agy_title = format_agy_title(args.title)
     elif reserved_round and reserved_round.title:
@@ -430,17 +457,20 @@ def _execute_delegation(
     except CodexBinaryNotFoundError as exc:
         return 2, {"status": "failed", "error": str(exc)}
 
-    remaining = None
     if (
         not args.dry_run
         and args.model is None
-        and active_routing_mode == "silent_best"
+        and route.routing_mode == "silent_best"
         and settings.quota_guardrail_enabled
     ):
-        remaining = _remaining_5h(query_codex_quota(codex_bin=codex_bin))
-    route = _resolve_settings_route(settings, active_routing_mode, task_tier, isolation_mode, remaining)
+        quota = query_codex_quota(
+            codex_bin=codex_bin, data_dir=store.data_dir, use_cache=True, max_age_seconds=60.0,
+        )
+        route = _resolve_settings_route(
+            settings, route.routing_mode, route.task_tier, isolation_mode, _remaining_5h(quota), args.reasoning_effort,
+        )
     model = args.model or route.model
-    reasoning_effort = args.reasoning_effort or route.reasoning_effort
+    reasoning_effort = route.reasoning_effort
 
     run_id = reserved_round.run_id if reserved_round else f"run-{uuid.uuid4().hex[:10]}"
     worktree_path: Path | None = None
@@ -488,8 +518,8 @@ def _execute_delegation(
             "status": "dry_run",
             "run_id": run_id,
             "title": agy_title,
-            "routing_mode": active_routing_mode,
-            "task_tier": task_tier,
+            "routing_mode": route.routing_mode,
+            "task_tier": route.task_tier,
             "model": model,
             "reasoning_effort": reasoning_effort,
             "web_search": bool(args.web_search),
@@ -515,7 +545,7 @@ def _execute_delegation(
         round_rec = next((rnd for rnd in record.rounds if rnd.run_id == run_id), None) if record else None
         if round_rec is None or round_rec.status != "running":
             tmp_dir.rmdir()
-            return 1, {"status": "cancelled", "error": "Follow-up stopped before launch."}
+            return 1, {"status": "cancelled", "error": "Delegation stopped before launch."}
     else:
         _, round_rec = store.start_round(
             run_id=run_id,
@@ -550,7 +580,7 @@ def _execute_delegation(
     stderr_file = tmp_dir / "stderr.log"
     stderr_fh = stderr_file.open("w+", encoding="utf-8", errors="replace")
 
-    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+    creationflags = (subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)) if sys.platform == "win32" else 0
     proc = subprocess.Popen(
         cmd,
         cwd=str(exec_cwd),
@@ -740,6 +770,7 @@ def _execute_delegation(
             pass
 
     stderr_text = ""
+    raw_err = ""
     try:
         if stderr_file.is_file():
             raw_err = stderr_file.read_text(encoding="utf-8", errors="replace").strip()
@@ -797,6 +828,7 @@ def _execute_delegation(
     latest_rnd = next((r for r in (latest_rec.rounds if latest_rec else []) if r.run_id == run_id), None)
     was_cancelled = latest_rnd is not None and latest_rnd.status == "cancelled"
 
+    error_code = None
     if was_cancelled:
         final_status = "cancelled"
         error_summary = latest_rnd.error_summary or "Cancelled by user."
@@ -805,7 +837,12 @@ def _execute_delegation(
         error_summary = None
     else:
         final_status = "failed"
-        error_summary = state["error"] or _clip(stderr_text, MAX_ERROR_CHARS) or f"Codex exited with code {exit_code}."
+        errors = ((state["error"] or "").casefold(), raw_err.casefold())
+        if args.session_id and any(marker in error for error in errors for marker in THREAD_WRITER_CONFLICT_MARKERS):
+            error_code = "thread_writer_busy"
+            error_summary = THREAD_WRITER_BUSY_SUMMARY
+        else:
+            error_summary = _clip(state["error"] or stderr_text, MAX_ERROR_CHARS) or f"Codex exited with code {exit_code}."
 
     clipped_final = _clip(final_msg, MAX_FINAL_SUMMARY_CHARS)
 
@@ -818,6 +855,7 @@ def _execute_delegation(
         changed_files=changed_files,
         final_message=clipped_final,
         error_summary=error_summary,
+        error_code=error_code,
         ended=True,
     )
 
@@ -847,6 +885,8 @@ def _execute_delegation(
         "warning": warning_note,
         "error": error_summary,
     }
+    if error_code:
+        summary["error_code"] = error_code
     return (0 if final_status == "completed" else 1), summary
 
 
@@ -860,14 +900,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Execution mode (default: workspace-write for serial same-workspace handoff, inherited on resume)",
     )
     parser.add_argument("--session-id", default=None, help="Existing Codex session UUID for multi-turn follow-up")
-    parser.add_argument("--run-id", help="Use a pending delegation round already registered for --session-id")
+    parser.add_argument("--run-id", help="Use an already registered pending delegation round")
     parser.add_argument("--source-model", default="Gemini", help="Label of delegating model shown in Codex Orbit")
     parser.add_argument("--model", default=None, help="Override the model selected by the routing policy")
     parser.add_argument(
         "--reasoning-effort",
         choices=VALID_EFFORTS,
         default=None,
-        help="Codex reasoning effort override (otherwise chosen by routing policy & task tier)",
+        help="Override the saved or policy-selected reasoning effort for this invocation",
     )
     parser.add_argument(
         "--task-tier",
@@ -897,9 +937,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Evaluate the route for --task-tier and check quota when needed without running a task",
     )
+    parser.add_argument(
+        "--confirm-if-needed",
+        action="store_true",
+        help="Return the route and quota for confirmation when automatic routing requires it",
+    )
     parser.add_argument("--get-settings", action="store_true", help="Print persisted Orbit settings and exit")
     parser.add_argument("--set-default-model", help="Persist the default model slug (empty resets the default)")
     parser.add_argument("--set-escalation-model", help="Persist the escalation model slug (empty resets the default)")
+    parser.add_argument(
+        "--set-reasoning-effort",
+        type=lambda value: value.strip().lower() or "auto",
+        choices=VALID_REASONING_EFFORT_SETTINGS,
+        help="Persist reasoning effort (empty or auto restores policy selection)",
+    )
     parser.add_argument("--set-quota-guardrail", choices=("on", "off"), help="Enable or disable the quota guardrail")
     parser.add_argument("--set-quota-threshold", type=int, help="Set the quota guardrail threshold percent (5 to 50)")
     parser.add_argument("--quota-remaining-5h", type=float, help="Override remaining quota percent for --plan-route")
@@ -935,8 +986,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="Print resolved invocation plan without executing Codex")
     args = parser.parse_args(argv)
-    if args.run_id and (not args.session_id or args.dry_run):
-        parser.error("--run-id requires --session-id and an executing delegation")
+    if args.run_id and args.dry_run:
+        parser.error("--run-id requires an executing delegation")
     if args.delete_prompt_file and not args.prompt_file:
         parser.error("--delete-prompt-file requires --prompt-file")
     if args.quota_remaining_5h is not None and not isfinite(args.quota_remaining_5h):
@@ -950,7 +1001,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     code, summary = run_delegation(args)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if summary.get("status") == "needs_confirmation":
+        print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
     raise SystemExit(code)
 
 

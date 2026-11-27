@@ -12,13 +12,19 @@ from server.delegation_store import _atomic_write_json, resolve_data_dir
 RoutingMode = Literal["silent_low_cost", "ask", "silent_best"]
 TaskTier = Literal["light", "standard", "complex"]
 UiLocale = Literal["auto", "zh-CN", "zh-TW", "en", "ja"]
+ReasoningEffortSetting = Literal["auto", "low", "medium", "high", "xhigh", "max", "ultra"]
 
 VALID_ROUTING_MODES: tuple[RoutingMode, ...] = ("silent_low_cost", "ask", "silent_best")
 VALID_TASK_TIERS: tuple[TaskTier, ...] = ("light", "standard", "complex")
 VALID_UI_LOCALES = ("auto", "zh", "en", "ja")
+VALID_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max", "ultra")
+VALID_REASONING_EFFORT_SETTINGS: tuple[ReasoningEffortSetting, ...] = (
+    "auto", "low", "medium", "high", "xhigh", "max", "ultra",
+)
 _CANONICAL_UI_LOCALES: tuple[UiLocale, ...] = ("auto", "zh-CN", "zh-TW", "en", "ja")
 DEFAULT_ROUTING_MODE: RoutingMode = "ask"
 DEFAULT_UI_LOCALE: UiLocale = "auto"
+DEFAULT_REASONING_EFFORT: ReasoningEffortSetting = "auto"
 
 MODEL_SOL = "gpt-6.2-sol"
 MODEL_ASTRA = "gpt-6.2-astra"
@@ -39,6 +45,7 @@ class OrbitSettings:
     escalation_model: str = MODEL_ASTRA
     quota_guardrail_enabled: bool = True
     quota_guardrail_threshold_pct: int = DEFAULT_QUOTA_GUARDRAIL_THRESHOLD_PCT
+    reasoning_effort: ReasoningEffortSetting = DEFAULT_REASONING_EFFORT
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -86,6 +93,15 @@ def _normalize_model(value: object, fallback: str) -> str:
     return (value.strip() or fallback) if isinstance(value, str) else fallback
 
 
+def _normalize_reasoning_effort(value: object) -> ReasoningEffortSetting | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower() or DEFAULT_REASONING_EFFORT
+    if normalized in VALID_REASONING_EFFORT_SETTINGS:
+        return cast(ReasoningEffortSetting, normalized)
+    return None
+
+
 def _normalize_quota_threshold(value: object) -> int:
     if isinstance(value, int) and not isinstance(value, bool):
         return max(5, min(value, 50))
@@ -114,6 +130,7 @@ def _parse_settings(raw: dict[str, object]) -> OrbitSettings:
         escalation_model=_normalize_model(raw.get("escalation_model"), MODEL_ASTRA),
         quota_guardrail_enabled=enabled if isinstance(enabled, bool) else True,
         quota_guardrail_threshold_pct=_normalize_quota_threshold(raw.get("quota_guardrail_threshold_pct")),
+        reasoning_effort=_normalize_reasoning_effort(raw.get("reasoning_effort")) or DEFAULT_REASONING_EFFORT,
     )
 
 
@@ -137,8 +154,9 @@ def save_settings(
     escalation_model: str | None | _Unset = _UNSET,
     quota_guardrail_enabled: bool | None = None,
     quota_guardrail_threshold_pct: int | None = None,
+    reasoning_effort: str | None | _Unset = _UNSET,
 ) -> OrbitSettings:
-    """Persist supplied fields atomically. A blank or None model resets its slug."""
+    """Persist supplied fields atomically. Blank or None resets model and effort settings."""
     path = _settings_path(data_dir)
     raw = _read_settings(path)
     if routing_mode is not None:
@@ -154,6 +172,16 @@ def save_settings(
         raw["default_model"] = default_model
     if escalation_model is not _UNSET:
         raw["escalation_model"] = escalation_model
+    if reasoning_effort is not _UNSET:
+        effort = (
+            DEFAULT_REASONING_EFFORT if reasoning_effort is None else _normalize_reasoning_effort(reasoning_effort)
+        )
+        if effort is None:
+            raise ValueError(
+                f"Invalid reasoning_effort {reasoning_effort!r}. "
+                f"Choose from {', '.join(VALID_REASONING_EFFORT_SETTINGS)}."
+            )
+        raw["reasoning_effort"] = effort
     if quota_guardrail_enabled is not None:
         if not isinstance(quota_guardrail_enabled, bool):
             raise ValueError("quota_guardrail_enabled must be a boolean.")
@@ -194,8 +222,19 @@ def resolve_route(
     quota_remaining_5h: float | None = None,
     quota_guardrail_enabled: bool = True,
     quota_guardrail_threshold_pct: int = DEFAULT_QUOTA_GUARDRAIL_THRESHOLD_PCT,
+    reasoning_effort_override: str | None = None,
 ) -> RouteDecision:
     """Resolve the model, reasoning effort, and confirmation for a task tier."""
+    explicit_effort = None
+    if reasoning_effort_override is not None:
+        normalized = _normalize_reasoning_effort(reasoning_effort_override)
+        if normalized is None:
+            raise ValueError(
+                f"Invalid reasoning_effort {reasoning_effort_override!r}. "
+                f"Choose from {', '.join(VALID_REASONING_EFFORT_SETTINGS)}."
+            )
+        if normalized != DEFAULT_REASONING_EFFORT:
+            explicit_effort = normalized
     eff_default = _normalize_model(default_model, MODEL_SOL)
     eff_escalation = _normalize_model(escalation_model, MODEL_ASTRA)
     is_read_only = isolation_mode == "read-only"
@@ -214,18 +253,22 @@ def resolve_route(
         else:
             effort = "high"
         return RouteDecision(
-            routing_mode, task_tier, eff_default, effort, False,
-            reason="Eco uses the default model and sets effort by task tier.",
+            routing_mode, task_tier, eff_default, explicit_effort or effort, False,
+            reason=(
+                "Eco uses the default model with the selected effort."
+                if explicit_effort else "Eco uses the default model and sets effort by task tier."
+            ),
         )
 
     if task_tier == "light":
+        effort = explicit_effort or "medium"
         return RouteDecision(
-            routing_mode, task_tier, eff_default, "medium", False,
-            reason="Light tasks use the default model at medium effort.",
+            routing_mode, task_tier, eff_default, effort, False,
+            reason=f"Light tasks use the default model at {effort} effort.",
         )
 
     if routing_mode == "silent_best":
-        effort = "high" if task_tier == "standard" else "xhigh"
+        effort = explicit_effort or ("high" if task_tier == "standard" else "xhigh")
         if low_quota and eff_escalation != eff_default:
             return RouteDecision(
                 routing_mode, task_tier, eff_default, effort, False,
@@ -241,16 +284,16 @@ def resolve_route(
 
     if task_tier == "standard":
         return RouteDecision(
-            routing_mode, task_tier, eff_default, "medium" if is_read_only else "high", False,
+            routing_mode, task_tier, eff_default, explicit_effort or ("medium" if is_read_only else "high"), False,
             reason="Balanced uses the default model for standard tasks.",
         )
 
     return RouteDecision(
-        routing_mode, task_tier, eff_default, "xhigh", True,
+        routing_mode, task_tier, eff_default, explicit_effort or "xhigh", True,
         recommended_model=eff_escalation,
-        recommended_effort="high" if is_read_only else "xhigh",
+        recommended_effort=explicit_effort or ("high" if is_read_only else "xhigh"),
         fallback_model=eff_default,
-        fallback_effort="xhigh",
+        fallback_effort=explicit_effort or "xhigh",
         reason="Balanced asks before using the escalation model for complex tasks.",
         guardrail_triggered=low_quota is not None,
         guardrail_note=f"{low_quota} Consider staying on {eff_default}." if low_quota else None,

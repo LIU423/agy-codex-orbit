@@ -248,15 +248,10 @@ def build_profile_overview(
                 b["direct_sessions"] += 1
                 b["direct_rounds"] += rounds
 
-        # Hot files from cached rollout state (O(1))
-        rollout_path = store._path_by_session_id.get(s.session_id)
-        state = store._states_by_path.get(rollout_path) if rollout_path else None
-        if state is not None:
-            for tid in state.turn_order:
-                for fp in state.turns_by_id[tid].changed_files_by_path.keys():
-                    fkey = fp.lower() if os.name == "nt" else fp
-                    file_sessions[fkey].add(s.session_id)
-                    file_display.setdefault(fkey, fp)
+        for fp in store.get_session_changed_files(s.session_id):
+            fkey = fp.lower() if os.name == "nt" else fp
+            file_sessions[fkey].add(s.session_id)
+            file_display.setdefault(fkey, fp)
 
         if len(recent_items) < 60:
             item = s.model_dump(mode="json")

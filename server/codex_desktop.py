@@ -20,9 +20,14 @@ from pathlib import Path
 from typing import Any
 
 from server.codex_locator import CodexBinaryNotFoundError, locate_codex_binary
+from server.delegation_store import _atomic_write_json, resolve_data_dir
 from server.session_store import default_codex_home
 
 TITLE_PREFIX = "agy: "
+_ANTIGRAVITY_QUOTA = {
+    "available": False,
+    "note": "Check the Antigravity account panel for quota details.",
+}
 
 
 def read_codex_model_catalog(codex_home: Path | str | None = None) -> list[dict[str, Any]]:
@@ -126,6 +131,7 @@ def _call_app_server_batch(
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0,
         env={**os.environ, "CODEX_HOME": str(codex_home)} if codex_home is not None else None,
     )
     stdin, stdout = proc.stdin, proc.stdout
@@ -173,7 +179,7 @@ def _call_app_server_batch(
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "codex-orbit", "version": "0.7.0"},
+                    "clientInfo": {"name": "codex-orbit", "version": "0.1.0"},
                     "capabilities": {"experimentalApi": True},
                 },
             }
@@ -306,20 +312,76 @@ def _read_rollout_fallback_quota(codex_home: Path) -> dict[str, Any] | None:
     return None
 
 
+def read_cached_codex_quota(
+    *,
+    data_dir: Path | str | None = None,
+    max_age_seconds: float = 60.0,
+    allow_stale: bool = False,
+) -> tuple[dict[str, Any], bool] | None:
+    """Load available quota from disk and report whether it is fresh."""
+    try:
+        path = resolve_data_dir(data_dir) / "quota_cache.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return None
+        fetched_at = payload.get("fetched_at")
+        if (
+            not isinstance(fetched_at, (float, int))
+            or isinstance(fetched_at, bool)
+            or not math.isfinite(fetched_at)
+        ):
+            return None
+        data = payload.get("data")
+        codex = data.get("codex") if isinstance(data, dict) else None
+        if not isinstance(codex, dict) or codex.get("available") is not True:
+            return None
+        is_fresh = (time.time() - fetched_at) <= max_age_seconds
+    except (OSError, ValueError, OverflowError, RecursionError):
+        return None
+    return (data, is_fresh) if is_fresh or allow_stale else None
+
+
+def write_cached_codex_quota(data: dict[str, Any], *, data_dir: Path | str | None = None) -> None:
+    """Persist available quota without making disk writes a requirement for live queries."""
+    codex = data.get("codex")
+    if not isinstance(codex, dict) or codex.get("available") is not True:
+        return
+    try:
+        path = resolve_data_dir(data_dir) / "quota_cache.json"
+        _atomic_write_json(path, {"fetched_at": time.time(), "data": data})
+    except OSError:
+        pass
+
+
+def read_rollout_fallback_quota_status(codex_home: Path | str | None = None) -> dict[str, Any] | None:
+    """Read quota from recent rollout tails without starting the app-server."""
+    home = Path(codex_home).expanduser() if codex_home is not None else default_codex_home()
+    fallback = _read_rollout_fallback_quota(home)
+    if fallback is None:
+        return None
+    return {
+        "codex": {"available": True, **fallback},
+        "antigravity": dict(_ANTIGRAVITY_QUOTA),
+    }
+
+
 def query_codex_quota(
     *,
     codex_bin: Path | str | None = None,
     codex_home: Path | str | None = None,
+    data_dir: Path | str | None = None,
+    use_cache: bool = False,
+    max_age_seconds: float = 60.0,
 ) -> dict[str, Any]:
-    """Query live Codex rate limits via `codex app-server --stdio` (with rollout fallback)."""
+    """Query live Codex rate limits with an optional disk cache and rollout fallback."""
+    if use_cache and data_dir is not None:
+        cached = read_cached_codex_quota(data_dir=data_dir, max_age_seconds=max_age_seconds)
+        if cached is not None:
+            return cached[0]
+
     default_home = default_codex_home()
     home = Path(codex_home).expanduser() if codex_home is not None else default_home
-    antigravity_note = {
-        "available": False,
-        "note": "Check the Antigravity account panel for quota details.",
-    }
 
-    err_msg: str | None = None
     try:
         binary = locate_codex_binary(codex_bin)
         raw = _call_app_server_rpc(
@@ -342,7 +404,7 @@ def query_codex_quota(
             if isinstance(reset_credits, dict) and isinstance(reset_credits.get("availableCount"), int)
             else None
         )
-        return {
+        data = {
             "codex": {
                 "available": True,
                 "source": "app_server",
@@ -352,21 +414,23 @@ def query_codex_quota(
                 "reset_credits_available": available_resets,
                 "buckets": buckets,
             },
-            "antigravity": antigravity_note,
+            "antigravity": dict(_ANTIGRAVITY_QUOTA),
         }
     except (CodexBinaryNotFoundError, OSError, TimeoutError, RuntimeError) as exc:
         err_msg = str(exc)
+    else:
+        if data_dir is not None:
+            write_cached_codex_quota(data, data_dir=data_dir)
+        return data
 
-    fallback = _read_rollout_fallback_quota(home)
+    fallback = read_rollout_fallback_quota_status(home)
     if fallback is not None:
-        return {
-            "codex": {"available": True, "warning": err_msg, **fallback},
-            "antigravity": antigravity_note,
-        }
+        fallback["codex"]["warning"] = err_msg
+        return fallback
 
     return {
         "codex": {"available": False, "error": err_msg or "Unable to query Codex quota."},
-        "antigravity": antigravity_note,
+        "antigravity": dict(_ANTIGRAVITY_QUOTA),
     }
 
 
@@ -456,6 +520,7 @@ def _is_codex_desktop_running() -> bool:
             errors="replace",
             timeout=3,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return "codex.exe" in proc.stdout.lower()
     except (OSError, subprocess.TimeoutExpired):

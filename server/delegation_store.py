@@ -64,6 +64,7 @@ def run_git(cwd: Path, args: list[str], *, timeout: int = 30) -> subprocess.Comp
         errors="replace",
         timeout=timeout,
         check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0,
     )
 
 
@@ -146,7 +147,7 @@ class DelegationStore:
         for rnd in record.rounds:
             if rnd.status == "running":
                 if rnd.source_model == "Orbit" and rnd.pid is None and rnd.child_pid is None:
-                    # App follow-ups are visible before the wrapper has registered its PID.
+                    # App runs are visible before the wrapper has registered its PID.
                     with suppress(ValueError):
                         started_at = datetime.fromisoformat(rnd.started_at).timestamp()
                         if datetime.now(timezone.utc).timestamp() - started_at < FOLLOWUP_STARTUP_GRACE_SECONDS:
@@ -185,18 +186,21 @@ class DelegationStore:
                 return rec
         return None
 
-    def get_by_run_id(self, run_id: str) -> DelegationSessionRecord | None:
+    def get_by_run_id(self, run_id: str, *, verify_liveness: bool = False) -> DelegationSessionRecord | None:
+        """Find a round's session record before or after Codex assigns its thread ID."""
         direct_path = self._record_path(run_id)
         if direct_path.is_file():
             try:
-                return DelegationSessionRecord.model_validate(
+                rec = DelegationSessionRecord.model_validate(
                     json.loads(direct_path.read_text(encoding="utf-8"))
                 )
+                if any(r.run_id == run_id for r in rec.rounds):
+                    return self._reconcile_liveness(rec) if verify_liveness else rec
             except (OSError, json.JSONDecodeError, ValueError):
                 pass
         for rec in self.load_all(verify_liveness=False):
             if any(r.run_id == run_id for r in rec.rounds):
-                return rec
+                return self._reconcile_liveness(rec) if verify_liveness else rec
         return None
 
     def start_round(
@@ -338,6 +342,7 @@ class DelegationStore:
         changed_files: list[str] | None = None,
         final_message: str | None = None,
         error_summary: str | None = None,
+        error_code: str | None = None,
         ended: bool = False,
     ) -> DelegationSessionRecord | None:
         rec = self.get_by_run_id(run_id)
@@ -375,6 +380,8 @@ class DelegationStore:
             target_round.final_message = final_message
         if error_summary is not None:
             target_round.error_summary = error_summary
+        if error_code is not None:
+            target_round.error_code = error_code
         if ended:
             target_round.ended_at = utc_now_iso()
 
