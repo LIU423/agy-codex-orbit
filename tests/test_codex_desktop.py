@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from pathlib import Path
 
 from server.codex_desktop import (
@@ -165,7 +166,8 @@ def test_ensure_codex_project_creates_reuses_and_backs_up(tmp_path: Path) -> Non
     assert gs_after["project-order"][0] == pid2
 
     # Second call with same workspace (different case on Windows) -> reuses project, no duplicate
-    res2 = ensure_codex_project_and_bind(str(workspace).upper(), "sess-2", codex_home=codex_home, allow_create=True)
+    workspace_again = str(workspace).upper() if sys.platform == "win32" else workspace
+    res2 = ensure_codex_project_and_bind(workspace_again, "sess-2", codex_home=codex_home, allow_create=True)
     assert res2["created"] is False
     assert res2["bound"] is True
     assert res2["project_id"] == pid

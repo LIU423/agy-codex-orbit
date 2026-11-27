@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+from ctypes import wintypes
 from dataclasses import dataclass, field
 
 from server.delegation_store import DelegationStore, is_process_alive
@@ -23,18 +24,68 @@ class CancelResult:
     message: str = ""
 
 
-def _win32_terminate_pid(pid: int) -> bool:
-    if sys.platform != "win32":
-        return False
-    PROCESS_TERMINATE = 0x0001
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
-    if not handle:
-        return False
+def _win32_terminate_tree(pid: int) -> None:
+    """Use a process snapshot when taskkill cannot enumerate the tree."""
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32")  # type: ignore[attr-defined]
+    kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(ProcessEntry))
+    kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(ProcessEntry))
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    children: dict[int, list[int]] = {}
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if snapshot and snapshot != ctypes.c_void_p(-1).value:
+        try:
+            entry = ProcessEntry(dwSize=ctypes.sizeof(ProcessEntry))
+            has_entry = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while has_entry:
+                children.setdefault(entry.th32ParentProcessID, []).append(entry.th32ProcessID)
+                has_entry = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+
+    targets = [pid]
+    seen = {pid, os.getpid()}
+    for parent in targets:
+        for child in children.get(parent, ()):
+            if child not in seen:
+                seen.add(child)
+                targets.append(child)
+    for target in reversed(targets):
+        handle = kernel32.OpenProcess(0x0001, False, target)  # PROCESS_TERMINATE
+        if handle:
+            try:
+                kernel32.TerminateProcess(handle, 1)
+            finally:
+                kernel32.CloseHandle(handle)
+
+
+def _send_posix_signal(pid: int, sig: signal.Signals) -> None:
     try:
-        return bool(kernel32.TerminateProcess(handle, 1))
-    finally:
-        kernel32.CloseHandle(handle)
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, sig)
+        else:
+            os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
 
 
 def terminate_process_tree(pid: int | None, *, wait_seconds: float = 2.0) -> bool:
@@ -51,7 +102,7 @@ def terminate_process_tree(pid: int | None, *, wait_seconds: float = 2.0) -> boo
 
     if sys.platform == "win32":
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
                 text=True,
@@ -60,8 +111,10 @@ def terminate_process_tree(pid: int | None, *, wait_seconds: float = 2.0) -> boo
                 timeout=8,
                 check=False,
             )
+            if result.returncode != 0:
+                _win32_terminate_tree(pid)
         except (OSError, subprocess.TimeoutExpired):
-            _win32_terminate_pid(pid)
+            _win32_terminate_tree(pid)
 
         deadline = time.monotonic() + max(0.2, wait_seconds)
         while time.monotonic() < deadline:
@@ -70,18 +123,14 @@ def terminate_process_tree(pid: int | None, *, wait_seconds: float = 2.0) -> boo
             time.sleep(0.05)
 
         if is_process_alive(pid):
-            _win32_terminate_pid(pid)
+            _win32_terminate_tree(pid)
             time.sleep(0.1)
         return not is_process_alive(pid)
 
-    # POSIX fallback
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        _send_posix_signal(pid, signal.SIGTERM)
     except OSError:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            return not is_process_alive(pid)
+        return not is_process_alive(pid)
 
     deadline = time.monotonic() + max(0.2, wait_seconds)
     while time.monotonic() < deadline:
@@ -90,12 +139,9 @@ def terminate_process_tree(pid: int | None, *, wait_seconds: float = 2.0) -> boo
         time.sleep(0.05)
 
     try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
+        _send_posix_signal(pid, signal.SIGKILL)
     except OSError:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
+        pass
     return not is_process_alive(pid)
 
 

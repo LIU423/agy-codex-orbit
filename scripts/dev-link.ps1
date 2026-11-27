@@ -37,8 +37,8 @@ if (Test-Path $assetsSrc) {
 $skillsSrc = Join-Path $repoRoot "skills"
 if (Test-Path $skillsSrc) {
     $skillsDst = Join-Path $targetDir "skills"
-    if (Test-Path $skillsDst) { Remove-Item $skillsDst -Recurse -Force }
-    Copy-Item $skillsSrc $skillsDst -Recurse -Force
+    New-Item -ItemType Directory -Path $skillsDst -Force | Out-Null
+    Copy-Item (Join-Path $skillsSrc "*") $skillsDst -Recurse -Force
 }
 
 # Write dev mcp_config.json pointing live at this repo's .venv, server/main.py, and dist/index.html

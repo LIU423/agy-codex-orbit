@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import math
+import ntpath
 import os
+import posixpath
+import queue
 import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -18,6 +23,46 @@ from server.codex_locator import CodexBinaryNotFoundError, locate_codex_binary
 from server.session_store import default_codex_home
 
 TITLE_PREFIX = "agy: "
+
+
+def read_codex_model_catalog(codex_home: Path | str | None = None) -> list[dict[str, Any]]:
+    """Return selectable models from the local Codex model cache."""
+    home = Path(codex_home).expanduser() if codex_home is not None else default_codex_home()
+    try:
+        cache = json.loads((home / "models_cache.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, RecursionError):
+        return []
+    models = cache.get("models") if isinstance(cache, dict) else None
+    if not isinstance(models, list):
+        return []
+
+    available: list[tuple[int | float, dict[str, Any]]] = []
+    for model in models:
+        if not isinstance(model, dict) or model.get("visibility") in ("hide", "hidden"):
+            continue
+        slug = model.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        levels = model.get("supported_reasoning_levels")
+        efforts = []
+        if isinstance(levels, list):
+            for level in levels:
+                effort = level.get("effort") if isinstance(level, dict) else level
+                if isinstance(effort, str) and effort:
+                    efforts.append(effort)
+        priority = model.get("priority")
+        if not isinstance(priority, (int, float)) or (isinstance(priority, float) and not math.isfinite(priority)):
+            priority = math.inf
+        default_effort = model.get("default_reasoning_level")
+        available.append((priority, {
+            "slug": slug,
+            "display_name": str(model.get("display_name") or slug),
+            "description": str(model.get("description") or ""),
+            "efforts": efforts,
+            "default_effort": default_effort if isinstance(default_effort, str) else None,
+        }))
+    available.sort(key=lambda item: item[0])
+    return [model for _, model in available]
 
 
 def format_agy_title(raw_title: str) -> str:
@@ -33,16 +78,13 @@ def format_agy_title(raw_title: str) -> str:
 
 
 def _norm_win_path(path: Path | str) -> str:
-    s = str(Path(path).expanduser().resolve()).rstrip("\\/")
-    # Keep drive root like C:\ intact
-    if len(s) == 2 and s[1] == ":":
-        s += "\\"
-    return s
+    return str(Path(path).expanduser().resolve())
 
 
 def _path_key(path: Path | str) -> str:
-    s = str(path).strip().replace("/", "\\").rstrip("\\")
-    return s.lower() if sys.platform == "win32" else s
+    if sys.platform == "win32":
+        return ntpath.normcase(ntpath.normpath(str(path).strip()))
+    return posixpath.normpath(str(path))
 
 
 def _format_reset_time(epoch_sec: int | float | None) -> tuple[str | None, str | None]:
@@ -64,7 +106,7 @@ def _format_reset_time(epoch_sec: int | float | None) -> tuple[str | None, str |
             d, rem = divmod(delta, 86400)
             rel = f"{d}d {rem // 3600}h"
         return iso, rel
-    except (ValueError, OSError, OverflowError):
+    except (TypeError, ValueError, OSError, OverflowError):
         return None, None
 
 
@@ -73,6 +115,7 @@ def _call_app_server_batch(
     calls: list[tuple[str, dict[str, Any]]],
     *,
     timeout: float = 10.0,
+    codex_home: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Execute one or more JSON-RPC requests on a single short-lived `codex app-server --stdio`."""
     proc = subprocess.Popen(
@@ -83,24 +126,40 @@ def _call_app_server_batch(
         text=True,
         encoding="utf-8",
         errors="replace",
+        env={**os.environ, "CODEX_HOME": str(codex_home)} if codex_home is not None else None,
     )
-    assert proc.stdin is not None and proc.stdout is not None
+    stdin, stdout = proc.stdin, proc.stdout
+    assert stdin is not None and stdout is not None
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def _read_stdout() -> None:
+        try:
+            for line in stdout:
+                lines.put(line)
+        except OSError:
+            pass
+        finally:
+            stdout.close()
+            lines.put(None)
+
+    # Reading on a worker lets the RPC deadline apply even if the child never returns a line.
+    threading.Thread(target=_read_stdout, daemon=True).start()
 
     def _send(obj: dict[str, Any]) -> None:
-        proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")  # type: ignore[union-attr]
-        proc.stdin.flush()  # type: ignore[union-attr]
+        stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        stdin.flush()
 
     def _recv_id(target_id: int, deadline: float) -> dict[str, Any]:
         while time.monotonic() < deadline:
-            line = proc.stdout.readline()  # type: ignore[union-attr]
-            if not line:
+            try:
+                line = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
                 break
-            line = line.strip()
-            if not line:
-                continue
+            if line is None:
+                raise RuntimeError("Codex app-server closed its output before responding.")
             try:
                 msg = json.loads(line)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
                 continue
             if isinstance(msg, dict) and msg.get("id") == target_id:
                 return msg
@@ -114,7 +173,7 @@ def _call_app_server_batch(
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "codex-orbit", "version": "0.6.1"},
+                    "clientInfo": {"name": "codex-orbit", "version": "0.7.0"},
                     "capabilities": {"experimentalApi": True},
                 },
             }
@@ -137,12 +196,16 @@ def _call_app_server_batch(
         return results
     finally:
         try:
-            proc.terminate()
+            if proc.poll() is None:
+                proc.terminate()
             proc.wait(timeout=3)
-        except Exception:
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        finally:
             try:
-                proc.kill()
-            except Exception:
+                stdin.close()
+            except OSError:
                 pass
 
 
@@ -152,9 +215,10 @@ def _call_app_server_rpc(
     params: dict[str, Any],
     *,
     timeout: float = 8.0,
+    codex_home: Path | None = None,
 ) -> dict[str, Any]:
     """Execute a single JSON-RPC request against a short-lived `codex app-server --stdio`."""
-    return _call_app_server_batch(codex_bin, [(method, params)], timeout=timeout)[0]
+    return _call_app_server_batch(codex_bin, [(method, params)], timeout=timeout, codex_home=codex_home)[0]
 
 
 def _format_window(win: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -163,17 +227,32 @@ def _format_window(win: dict[str, Any] | None) -> dict[str, Any] | None:
     used = win.get("usedPercent")
     if used is None:
         used = win.get("used_percent")
-    if not isinstance(used, (int, float)):
+    if not isinstance(used, (int, float)) or isinstance(used, bool):
         return None
-    remaining = max(0.0, min(100.0, round(100.0 - float(used), 1)))
+    try:
+        used = float(used)
+    except OverflowError:
+        return None
+    if not math.isfinite(used):
+        return None
+    remaining = max(0.0, min(100.0, round(100.0 - used, 1)))
     mins = win.get("windowDurationMins") or win.get("window_minutes")
     resets_at = win.get("resetsAt") or win.get("resets_at")
     reset_local, resets_in = _format_reset_time(resets_at)
+
+    def _as_int(value: Any) -> int | None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                return int(value)
+            except (ValueError, OverflowError):
+                pass
+        return None
+
     return {
-        "used_percent": round(float(used), 1),
+        "used_percent": round(used, 1),
         "remaining_percent": remaining,
-        "window_minutes": int(mins) if isinstance(mins, (int, float)) else None,
-        "resets_at": int(resets_at) if isinstance(resets_at, (int, float)) else None,
+        "window_minutes": _as_int(mins),
+        "resets_at": _as_int(resets_at),
         "resets_at_local": reset_local,
         "resets_in": resets_in,
     }
@@ -181,13 +260,18 @@ def _format_window(win: dict[str, Any] | None) -> dict[str, Any] | None:
 
 def _read_rollout_fallback_quota(codex_home: Path) -> dict[str, Any] | None:
     sessions_dir = codex_home / "sessions"
-    if not sessions_dir.is_dir():
+    try:
+        files = list(sessions_dir.rglob("rollout-*.jsonl"))
+    except OSError:
         return None
-    files = sorted(
-        sessions_dir.rglob("rollout-*.jsonl"),
-        key=lambda p: p.stat().st_mtime_ns if p.exists() else 0,
-        reverse=True,
-    )
+
+    def _mtime(path: Path) -> int:
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    files.sort(key=_mtime, reverse=True)
     for fp in files[:3]:
         try:
             with fp.open("rb") as fh:
@@ -202,16 +286,20 @@ def _read_rollout_fallback_quota(codex_home: Path) -> dict[str, Any] | None:
                 continue
             try:
                 rec = json.loads(line)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
                 continue
-            pl = rec.get("payload")
+            pl = rec.get("payload") if isinstance(rec, dict) else None
             if isinstance(pl, dict) and pl.get("type") == "token_count" and isinstance(pl.get("rate_limits"), dict):
                 rl = pl["rate_limits"]
+                primary = _format_window(rl.get("primary"))
+                secondary = _format_window(rl.get("secondary"))
+                if primary is None and secondary is None:
+                    continue
                 return {
                     "source": "rollout_cache",
                     "plan_type": rl.get("plan_type"),
-                    "primary": _format_window(rl.get("primary")),
-                    "secondary": _format_window(rl.get("secondary")),
+                    "primary": primary,
+                    "secondary": secondary,
                     "reset_credits_available": None,
                     "buckets": {},
                 }
@@ -221,19 +309,22 @@ def _read_rollout_fallback_quota(codex_home: Path) -> dict[str, Any] | None:
 def query_codex_quota(
     *,
     codex_bin: Path | str | None = None,
-    codex_home: Path | None = None,
+    codex_home: Path | str | None = None,
 ) -> dict[str, Any]:
     """Query live Codex rate limits via `codex app-server --stdio` (with rollout fallback)."""
-    home = codex_home or default_codex_home()
+    default_home = default_codex_home()
+    home = Path(codex_home).expanduser() if codex_home is not None else default_home
     antigravity_note = {
         "available": False,
-        "note": "Antigravity 暂无公开的本机额度查询 CLI/API，请以 Antigravity 客户端账户面板为准。",
+        "note": "Check the Antigravity account panel for quota details.",
     }
 
     err_msg: str | None = None
     try:
         binary = locate_codex_binary(codex_bin)
-        raw = _call_app_server_rpc(binary, "account/rateLimits/read", {}, timeout=8.0)
+        raw = _call_app_server_rpc(
+            binary, "account/rateLimits/read", {}, timeout=8.0, codex_home=home if home != default_home else None
+        )
         rl = raw.get("rateLimits") if isinstance(raw.get("rateLimits"), dict) else {}
         buckets: dict[str, Any] = {}
         by_id = raw.get("rateLimitsByLimitId")
@@ -342,6 +433,18 @@ def set_codex_thread_name(
 
 
 def _is_codex_desktop_running() -> bool:
+    if sys.platform in ("darwin", "linux"):
+        try:
+            proc = subprocess.run(
+                ["pgrep", "-x", "Codex|codex-desktop"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+            )
+            return proc.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
     if sys.platform != "win32":
         return False
     try:

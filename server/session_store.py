@@ -161,12 +161,21 @@ def _merge_turns_with_delegation(
     available_indices = [i for i in range(len(merged)) if i not in matched_turn_indices]
     pending_rounds: list[DelegationRoundRecord] = []
     for rnd in unmatched_rounds:
-        if available_indices:
-            idx = available_indices.pop(0)
-            matched_turn_indices.add(idx)
-            merged[idx] = _apply_round_to_turn(merged[idx], rnd)
-        else:
+        idx = next(iter(available_indices), None)
+        if rnd.source_model == "Orbit":
+            # A follow-up in a direct Codex session can have earlier, unmatched turns.
+            # Rollout timestamps can be rounded to whole seconds.
+            idx = next((
+                i for i in available_indices
+                if merged[i].started_at
+                and merged[i].started_at[:19] >= rnd.started_at[:19]
+                and merged[i].prompt.strip() == rnd.prompt
+            ), None)
+        if idx is None:
             pending_rounds.append(rnd)
+            continue
+        available_indices.remove(idx)
+        merged[idx] = _apply_round_to_turn(merged[idx], rnd)
 
     # Pass 3: append still-starting rounds that haven't flushed a turn into rollout yet
     for rnd in pending_rounds:

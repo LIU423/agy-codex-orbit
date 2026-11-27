@@ -2,7 +2,7 @@
   "name": "agy-codex-orbit",
   "displayName": "Codex Orbit",
   "description": "Monitor local OpenAI Codex sessions in real time with zero model token overhead and delegate scoped tasks from Antigravity.",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Open Codex Orbit to monitor local Codex sessions",

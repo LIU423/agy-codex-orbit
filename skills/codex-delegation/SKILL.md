@@ -16,21 +16,27 @@ Always read [references/model_profile.md](references/model_profile.md) before dr
    - **Codex (delegate)**: Backend architecture, APIs, business logic, parsers, persistence/SQL, CLI/systems tooling, complex debugging, backend tests, and independent read-only code reviews.
 2. **Classify Task Tier & Check Active Routing Policy**:
    - Classify the delegated backend task as `--task-tier light | standard | complex` per [references/model_profile.md](references/model_profile.md).
-   - Resolve the active persisted policy (`silent_low_cost` | `ask` [default] | `silent_best`) before dispatching:
-     ```powershell
-     $rt = Get-Content "$env:LOCALAPPDATA\agy-codex-orbit\runtime.json" -Raw | ConvertFrom-Json
-     & $rt.python_bin -u $rt.delegate_cli --plan-route --task-tier complex --mode workspace-write
-     ```
+   - Resolve the active persisted policy (`silent_low_cost` | `ask` [default] | `silent_best`), configurable default/escalation models, and low-quota guardrail before dispatching:
+     - **Windows (PowerShell)**:
+       ```powershell
+       $rt = Get-Content "$env:LOCALAPPDATA\agy-codex-orbit\runtime.json" -Raw | ConvertFrom-Json
+       & $rt.python_bin -u $rt.delegate_cli --plan-route --task-tier complex --mode workspace-write
+       ```
+     - **macOS / Linux (`sh` / `bash` / `zsh`)**:
+       ```bash
+       eval "$(python3 -c 'import json, os, shlex; d=json.load(open(os.path.expanduser("~/.agy-codex-orbit/runtime.json"))); print(f"PY={shlex.quote(d[\"python_bin\"])} CLI={shlex.quote(d[\"delegate_cli\"])}")')"
+       "$PY" -u "$CLI" --plan-route --task-tier complex --mode workspace-write
+       ```
    - Follow the returned policy strictly:
-     - **`silent_low_cost`（节能模式 / Eco）**: Dispatch silently with `gpt-6.2-sol` and the returned effort; never escalate to Astra.
-     - **`ask`（均衡模式 / Balanced — 默认）**: If `requires_confirmation` is `false`, dispatch silently with the returned `model` & `reasoning_effort`. If `requires_confirmation` is `true` (`complex` tier), **DO NOT dispatch yet** — present the recommended `gpt-6.2-astra` vs `gpt-6.2-sol` option together with the returned **Codex 5h & 7d remaining quota + reset times** (and Antigravity quota note), and let the user decide.
-     - **`silent_best`（极致模式 / Max）**: Dispatch silently with the returned best `model` (`gpt-6.2-astra` for `standard`/`complex`) & `reasoning_effort` without asking.
-3. **Switching Policies via Chat**:
-   - When the user asks to change the routing policy (e.g., "切到节能模式" / "切到均衡模式" / "切到极致模式"), persist it immediately so both future turns and the **Codex Orbit** UI stay synchronized:
-     ```powershell
-     $rt = Get-Content "$env:LOCALAPPDATA\agy-codex-orbit\runtime.json" -Raw | ConvertFrom-Json
-     & $rt.python_bin -u $rt.delegate_cli --set-routing-mode silent_best
-     ```
+     - **`silent_low_cost`（节能模式 / Eco）**: Dispatch silently with the returned default `model` (default `gpt-6.2-sol`) and effort; never escalate.
+     - **`ask`（均衡模式 / Balanced — 默认）**: If `requires_confirmation` is `false`, dispatch silently with the returned `model` & `reasoning_effort`. If `requires_confirmation` is `true` (`complex` tier), **DO NOT dispatch yet** — present the recommended escalation model vs. default model together with the returned **Codex 5h & 7d remaining quota + reset times** (and any `guardrail_note` warning if 5h quota is below threshold), and let the user decide.
+     - **`silent_best`（极致模式 / Max）**: Dispatch silently with the returned `model` & `reasoning_effort` without asking. Note: if the low-quota guardrail triggers (`guardrail_triggered: true`, 5h remaining below threshold), `--plan-route` and automatic live dispatch safely downgrade `model` to the configured default model while preserving the target `reasoning_effort`.
+3. **Switching Policies, Models & Running Diagnostics via Chat**:
+   - When the user asks to change routing policy, models, or guardrail settings, persist them immediately so future turns and the **Codex Orbit** UI stay synchronized:
+     - `--set-routing-mode silent_low_cost | ask | silent_best`
+     - `--set-default-model <slug>` / `--set-escalation-model <slug>` (empty string restores default)
+     - `--set-quota-guardrail on | off` / `--set-quota-threshold <5..50>`
+     - `--get-settings` / `--doctor` / `--prune-worktrees`
 
 ## 2. Workspace Sharing, Project Binding & `agy:` Naming
 

@@ -20,10 +20,15 @@ def test_ui_locale_persistence(tmp_path: Path) -> None:
     assert load_ui_locale(data_dir) == DEFAULT_UI_LOCALE
     assert save_ui_locale("en", data_dir) == "en"
     assert load_ui_locale(data_dir) == "en"
-    assert save_ui_locale("zh", data_dir) == "zh"
-    assert load_ui_locale(data_dir) == "zh"
+    assert save_ui_locale("zh-CN", data_dir) == "zh-CN"
+    assert load_ui_locale(data_dir) == "zh-CN"
+    assert save_ui_locale("zh-TW", data_dir) == "zh-TW"
+    assert load_ui_locale(data_dir) == "zh-TW"
     assert save_ui_locale("ja", data_dir) == "ja"
     assert load_ui_locale(data_dir) == "ja"
+    # Legacy "zh" normalizes cleanly to "zh-CN"
+    assert save_ui_locale("zh", data_dir) == "zh-CN"
+    assert load_ui_locale(data_dir) == "zh-CN"
     with pytest.raises(ValueError):
         save_ui_locale("fr", data_dir)
 

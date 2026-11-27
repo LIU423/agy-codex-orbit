@@ -2,7 +2,7 @@
 
 Invoked by Antigravity (Gemini) via `run_command`:
 - Runs `codex exec --json` (new session) or `codex exec resume <session_id> --json` (follow-up round)
-- Defaults to `gpt-6.2-sol` with explicit `model_reasoning_effort` (never silently escalating to Astra or ultra)
+- Selects the model and reasoning effort from persisted routing settings
 - Supports same-workspace serial handoff (`workspace-write`), `read-only` review, or parallel `worktree` isolation
 - Sets Codex thread title with `agy: ` prefix via official `thread/name/set` and binds/creates Codex Desktop project
 - Writes live delegation metadata + PID to `${PLUGIN_DATA}` for zero-token monitoring in Codex Orbit
@@ -22,6 +22,8 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import suppress
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -36,22 +38,25 @@ from server.codex_desktop import (
     set_codex_thread_name,
 )
 from server.codex_locator import CodexBinaryNotFoundError, locate_codex_binary
-from server.delegation_store import DelegationStore
-from server.models import IsolationMode
+from server.delegation_store import DelegationStore, prune_idle_worktrees
+from server.delegation_store import run_git as _run_git
+from server.doctor import run_doctor
+from server.models import DelegationRoundRecord, DelegationSessionRecord, IsolationMode
 from server.process_control import terminate_process_tree
 from server.routing_policy import (
     DEFAULT_ROUTING_MODE,
     ROUTING_MODE_LABELS,
     VALID_ROUTING_MODES,
     VALID_TASK_TIERS,
+    OrbitSettings,
+    RouteDecision,
     RoutingMode,
     TaskTier,
-    load_routing_mode,
+    load_settings,
     resolve_route,
-    save_routing_mode,
+    save_settings,
 )
 
-DEFAULT_CODEX_MODEL = "gpt-6.2-sol"
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 MAX_FINAL_SUMMARY_CHARS = 1800
 MAX_ERROR_CHARS = 600
@@ -75,19 +80,6 @@ def _derive_title_from_prompt(prompt: str) -> str:
         if stripped:
             return format_agy_title(stripped[:60])
     return format_agy_title("Codex Task")
-
-
-def _run_git(cwd: Path, args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-        check=False,
-    )
 
 
 def _is_git_repo(cwd: Path) -> bool:
@@ -267,7 +259,13 @@ def _parse_json_event(
 
 def _read_prompt(args: argparse.Namespace) -> str:
     if args.prompt_file:
-        return Path(args.prompt_file).read_text(encoding="utf-8").strip()
+        prompt_path = Path(args.prompt_file)
+        try:
+            return prompt_path.read_text(encoding="utf-8").strip()
+        finally:
+            if args.delete_prompt_file:
+                with suppress(OSError):
+                    prompt_path.unlink(missing_ok=True)
     if args.prompt is not None and args.prompt != "-":
         return args.prompt.strip()
     if not sys.stdin.isatty():
@@ -275,44 +273,131 @@ def _read_prompt(args: argparse.Namespace) -> str:
     return ""
 
 
-def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
-    if args.set_routing_mode:
-        saved = save_routing_mode(args.set_routing_mode, data_dir=args.data_dir)
-        return 0, {
-            "routing_mode": saved,
-            "routing_mode_label": ROUTING_MODE_LABELS[saved],
-        }
+def _remaining_5h(quota: dict[str, Any]) -> float | None:
+    codex = quota.get("codex")
+    primary = codex.get("primary") if isinstance(codex, dict) else None
+    remaining = primary.get("remaining_percent") if isinstance(primary, dict) else None
+    if isinstance(remaining, (int, float)) and not isinstance(remaining, bool) and isfinite(remaining):
+        return float(remaining)
+    return None
 
-    if args.get_routing_mode:
-        active = load_routing_mode(data_dir=args.data_dir)
-        return 0, {
-            "routing_mode": active,
-            "routing_mode_label": ROUTING_MODE_LABELS[active],
+
+def _resolve_settings_route(
+    settings: OrbitSettings,
+    routing_mode: RoutingMode,
+    task_tier: TaskTier,
+    isolation_mode: str,
+    quota_remaining_5h: float | None = None,
+) -> RouteDecision:
+    return resolve_route(
+        routing_mode=routing_mode,
+        task_tier=task_tier,
+        isolation_mode=isolation_mode,
+        default_model=settings.default_model,
+        escalation_model=settings.escalation_model,
+        quota_remaining_5h=quota_remaining_5h,
+        quota_guardrail_enabled=settings.quota_guardrail_enabled,
+        quota_guardrail_threshold_pct=settings.quota_guardrail_threshold_pct,
+    )
+
+
+def _plan_route(args: argparse.Namespace, settings: OrbitSettings) -> dict[str, Any]:
+    active_mode: RoutingMode = args.routing_mode or settings.routing_mode
+    tier: TaskTier = args.task_tier or "standard"
+    remaining = args.quota_remaining_5h
+    decision = _resolve_settings_route(settings, active_mode, tier, args.mode, remaining)
+    quota = None
+    if remaining is None and (
+        decision.requires_confirmation
+        or (active_mode == "silent_best" and settings.quota_guardrail_enabled and tier in ("standard", "complex"))
+    ):
+        quota = query_codex_quota(codex_bin=args.codex_bin)
+        remaining = _remaining_5h(quota)
+        if remaining is not None:
+            decision = _resolve_settings_route(settings, active_mode, tier, args.mode, remaining)
+    elif decision.guardrail_triggered:
+        quota = {
+            "codex": {
+                "available": True,
+                "source": "override",
+                "primary": {"remaining_percent": remaining},
+            }
         }
+    result = decision.to_dict()
+    if quota is not None:
+        result["quota"] = quota
+    return result
+
+
+def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    if args.doctor:
+        report = run_doctor(data_dir=args.data_dir, codex_bin=args.codex_bin)
+        return (0 if report["ok"] else 1), report
+
+    if args.prune_worktrees:
+        result = prune_idle_worktrees(DelegationStore(data_dir=args.data_dir))
+        return (1 if result["errors"] else 0), result
+
+    new_settings = {
+        "default_model": args.set_default_model,
+        "escalation_model": args.set_escalation_model,
+        "quota_guardrail_enabled": None if args.set_quota_guardrail is None else args.set_quota_guardrail == "on",
+        "quota_guardrail_threshold_pct": args.set_quota_threshold,
+    }
+    updates = {key: value for key, value in new_settings.items() if value is not None}
+    if updates or args.set_routing_mode is not None:
+        settings = save_settings(args.data_dir, routing_mode=args.set_routing_mode, **updates)
+    else:
+        settings = load_settings(args.data_dir)
+
+    if args.get_settings or updates:
+        return 0, settings.to_dict()
+
+    if args.get_routing_mode or args.set_routing_mode:
+        active = settings.routing_mode
+        return 0, {"routing_mode": active, "routing_mode_label": ROUTING_MODE_LABELS[active]}
 
     if args.plan_route:
-        active_mode: RoutingMode = args.routing_mode or load_routing_mode(data_dir=args.data_dir)
-        tier: TaskTier = args.task_tier or "standard"
-        decision = resolve_route(
-            routing_mode=active_mode,
-            task_tier=tier,
-            isolation_mode=args.mode,
-        )
-        result = decision.to_dict()
-        if decision.requires_confirmation:
-            result["quota"] = query_codex_quota(codex_bin=args.codex_bin)
-        return 0, result
+        return 0, _plan_route(args, settings)
 
     if args.check_quota:
         quota = query_codex_quota(codex_bin=args.codex_bin)
         return 0, quota
 
+    store = DelegationStore(data_dir=args.data_dir)
+    existing_rec = store.get_by_session_id(args.session_id, verify_liveness=False) if args.session_id else None
+    reserved_round = None
+    if args.run_id:
+        if existing_rec and existing_rec.session_id == args.session_id:
+            reserved_round = next((rnd for rnd in existing_rec.rounds if rnd.run_id == args.run_id), None)
+        if reserved_round is None or reserved_round.status != "running" or reserved_round.pid is not None:
+            return 2, {"status": "failed", "error": "No pending round for this run and session."}
+        store.update_round(args.run_id, pid=os.getpid())
+
+    try:
+        code, summary = _execute_delegation(args, settings, store, existing_rec, reserved_round)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        if reserved_round is None:
+            raise
+        code, summary = 2, {"status": "failed", "error": str(exc)}
+
+    if code and reserved_round is not None:
+        latest = store.get_by_run_id(reserved_round.run_id)
+        if latest and any(rnd.run_id == reserved_round.run_id and rnd.status == "running" for rnd in latest.rounds):
+            store.update_round(reserved_round.run_id, status="failed", error_summary=summary["error"], ended=True)
+    return code, summary
+
+
+def _execute_delegation(
+    args: argparse.Namespace,
+    settings: OrbitSettings,
+    store: DelegationStore,
+    existing_rec: DelegationSessionRecord | None,
+    reserved_round: DelegationRoundRecord | None,
+) -> tuple[int, dict[str, Any]]:
     prompt = _read_prompt(args)
     if not prompt:
         return 2, {"status": "failed", "error": "Empty prompt. Pass --prompt, --prompt-file, or stdin."}
-
-    store = DelegationStore(data_dir=args.data_dir)
-    existing_rec = store.get_by_session_id(args.session_id, verify_liveness=False) if args.session_id else None
 
     if args.cwd:
         workspace_dir = Path(args.cwd).expanduser().resolve()
@@ -328,18 +413,13 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     if args.session_id and existing_rec is not None and not args.mode_explicit:
         isolation_mode = existing_rec.isolation_mode
 
-    active_routing_mode: RoutingMode = args.routing_mode or load_routing_mode(data_dir=args.data_dir)
+    active_routing_mode: RoutingMode = args.routing_mode or settings.routing_mode
     task_tier: TaskTier = args.task_tier or "standard"
-    route = resolve_route(
-        routing_mode=active_routing_mode,
-        task_tier=task_tier,
-        isolation_mode=isolation_mode,
-    )
-    model = args.model or route.model
-    reasoning_effort = args.reasoning_effort or route.reasoning_effort
 
     if args.title:
         agy_title = format_agy_title(args.title)
+    elif reserved_round and reserved_round.title:
+        agy_title = reserved_round.title
     elif existing_rec and existing_rec.title:
         agy_title = format_agy_title(existing_rec.title)
     else:
@@ -350,7 +430,19 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     except CodexBinaryNotFoundError as exc:
         return 2, {"status": "failed", "error": str(exc)}
 
-    run_id = f"run-{uuid.uuid4().hex[:10]}"
+    remaining = None
+    if (
+        not args.dry_run
+        and args.model is None
+        and active_routing_mode == "silent_best"
+        and settings.quota_guardrail_enabled
+    ):
+        remaining = _remaining_5h(query_codex_quota(codex_bin=codex_bin))
+    route = _resolve_settings_route(settings, active_routing_mode, task_tier, isolation_mode, remaining)
+    model = args.model or route.model
+    reasoning_effort = args.reasoning_effort or route.reasoning_effort
+
+    run_id = reserved_round.run_id if reserved_round else f"run-{uuid.uuid4().hex[:10]}"
     worktree_path: Path | None = None
     worktree_branch: str | None = None
     exec_cwd = workspace_dir
@@ -412,20 +504,33 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             "command": cmd,
         }
 
-    _, round_rec = store.start_round(
-        run_id=run_id,
-        workspace_dir=str(workspace_dir),
-        prompt=prompt,
-        isolation_mode=isolation_mode,
-        source_model=args.source_model,
-        title=agy_title,
-        session_id=args.session_id,
-        worktree_path=str(worktree_path) if worktree_path else None,
-        worktree_branch=worktree_branch,
-        model=model,
-        reasoning_effort=reasoning_effort,
-        pid=os.getpid(),
-    )
+    if reserved_round is not None:
+        record = store.update_round(
+            run_id,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            worktree_path=str(worktree_path) if worktree_path else None,
+            worktree_branch=worktree_branch,
+        )
+        round_rec = next((rnd for rnd in record.rounds if rnd.run_id == run_id), None) if record else None
+        if round_rec is None or round_rec.status != "running":
+            tmp_dir.rmdir()
+            return 1, {"status": "cancelled", "error": "Follow-up stopped before launch."}
+    else:
+        _, round_rec = store.start_round(
+            run_id=run_id,
+            workspace_dir=str(workspace_dir),
+            prompt=prompt,
+            isolation_mode=isolation_mode,
+            source_model=args.source_model,
+            title=agy_title,
+            session_id=args.session_id,
+            worktree_path=str(worktree_path) if worktree_path else None,
+            worktree_branch=worktree_branch,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            pid=os.getpid(),
+        )
 
     start_mono = time.perf_counter()
     state: dict[str, Any] = {
@@ -456,6 +561,7 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         encoding="utf-8",
         errors="replace",
         creationflags=creationflags,
+        start_new_session=sys.platform != "win32",
     )
     store.update_round(run_id, child_pid=proc.pid)
 
@@ -724,6 +830,8 @@ def run_delegation(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "source_model": args.source_model,
         "model": model,
         "reasoning_effort": reasoning_effort,
+        "guardrail_triggered": route.guardrail_triggered,
+        "guardrail_note": route.guardrail_note,
         "web_search": bool(args.web_search),
         "isolation_mode": isolation_mode,
         "workspace_dir": str(workspace_dir),
@@ -752,8 +860,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Execution mode (default: workspace-write for serial same-workspace handoff, inherited on resume)",
     )
     parser.add_argument("--session-id", default=None, help="Existing Codex session UUID for multi-turn follow-up")
+    parser.add_argument("--run-id", help="Use a pending delegation round already registered for --session-id")
     parser.add_argument("--source-model", default="Gemini", help="Label of delegating model shown in Codex Orbit")
-    parser.add_argument("--model", default=None, help=f"Codex model slug (default: {DEFAULT_CODEX_MODEL})")
+    parser.add_argument("--model", default=None, help="Override the model selected by the routing policy")
     parser.add_argument(
         "--reasoning-effort",
         choices=VALID_EFFORTS,
@@ -786,11 +895,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--plan-route",
         action="store_true",
-        help="Evaluate active routing mode for --task-tier (and fetch quota if confirmation is required) without running Codex",
+        help="Evaluate the route for --task-tier and check quota when needed without running a task",
     )
+    parser.add_argument("--get-settings", action="store_true", help="Print persisted Orbit settings and exit")
+    parser.add_argument("--set-default-model", help="Persist the default model slug (empty resets the default)")
+    parser.add_argument("--set-escalation-model", help="Persist the escalation model slug (empty resets the default)")
+    parser.add_argument("--set-quota-guardrail", choices=("on", "off"), help="Enable or disable the quota guardrail")
+    parser.add_argument("--set-quota-threshold", type=int, help="Set the quota guardrail threshold percent (5 to 50)")
+    parser.add_argument("--quota-remaining-5h", type=float, help="Override remaining quota percent for --plan-route")
+    parser.add_argument("--doctor", action="store_true", help="Check the Orbit installation and Codex runtime")
+    parser.add_argument("--prune-worktrees", action="store_true", help="Remove idle Orbit worktrees")
     parser.add_argument("--title", default=None, help="Short session title (auto-prefixed with 'agy: ')")
     parser.add_argument("--prompt", default=None, help="Task prompt text (or '-' to read from stdin)")
     parser.add_argument("--prompt-file", default=None, help="Read task prompt from a UTF-8 file")
+    parser.add_argument("--delete-prompt-file", action="store_true", help="Delete --prompt-file after reading it")
     parser.add_argument("--data-dir", default=None, help="Override Codex Orbit plugin data directory")
     parser.add_argument("--codex-bin", default=None, help="Override path to codex executable")
     parser.add_argument("--timeout", type=int, default=1800, help="Timeout in seconds (default: 1800)")
@@ -817,6 +935,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="Print resolved invocation plan without executing Codex")
     args = parser.parse_args(argv)
+    if args.run_id and (not args.session_id or args.dry_run):
+        parser.error("--run-id requires --session-id and an executing delegation")
+    if args.delete_prompt_file and not args.prompt_file:
+        parser.error("--delete-prompt-file requires --prompt-file")
+    if args.quota_remaining_5h is not None and not isfinite(args.quota_remaining_5h):
+        parser.error("--quota-remaining-5h must be a finite number")
     args.mode_explicit = args.mode is not None
     if args.mode is None:
         args.mode = "workspace-write"

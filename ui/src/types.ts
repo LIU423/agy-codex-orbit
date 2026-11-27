@@ -1,8 +1,8 @@
 export type SessionStatus = "running" | "completed" | "aborted" | "idle";
 export type IsolationMode = "read-only" | "worktree" | "workspace-write";
 export type RoutingMode = "silent_low_cost" | "ask" | "silent_best";
-export type UiLocale = "auto" | "zh" | "en" | "ja";
-export type ResolvedLocale = "zh" | "en" | "ja";
+export type UiLocale = "auto" | "zh-CN" | "zh-TW" | "en" | "ja";
+export type ResolvedLocale = "zh-CN" | "zh-TW" | "en" | "ja";
 export type OriginFilter = "all" | "agy" | "direct";
 export type HeatmapMetric = "tokens" | "sessions";
 
@@ -125,6 +125,49 @@ export interface ListSessionsResponse {
   sessions_dir_exists: boolean;
   routing_mode?: RoutingMode;
   ui_locale?: UiLocale;
+  default_model?: string;
+  escalation_model?: string;
+  quota_guardrail_enabled?: boolean;
+  quota_guardrail_threshold_pct?: number;
+}
+
+export interface ModelCatalogEntry {
+  slug: string;
+  display_name: string;
+  description: string;
+  efforts: string[];
+  default_effort?: string | null;
+}
+
+export interface OrbitSettingsResponse {
+  routing_mode: RoutingMode;
+  ui_locale: UiLocale;
+  default_model: string;
+  escalation_model: string;
+  quota_guardrail_enabled: boolean;
+  quota_guardrail_threshold_pct: number;
+  available_models: ModelCatalogEntry[];
+}
+
+export interface DoctorCheckItem {
+  id: string;
+  status: "ok" | "warning" | "error" | "skipped";
+  summary: string;
+  detail: string;
+}
+
+export interface DoctorReport {
+  ok: boolean;
+  platform: string;
+  checks: DoctorCheckItem[];
+  settings: Omit<OrbitSettingsResponse, "available_models">;
+  available_models: ModelCatalogEntry[];
+}
+
+export interface PruneWorktreesResult {
+  removed: string[];
+  skipped_running: string[];
+  errors: string[];
 }
 
 export interface OpenOrbitBootstrap {
@@ -197,6 +240,13 @@ export interface TopStatEntry {
   share_pct: number;
 }
 
+export interface ModelBreakdownEntry {
+  name: string;
+  count: number;
+  share_pct: number;
+  tokens: number;
+}
+
 export interface HotFileEntry {
   path: string;
   short_name: string;
@@ -227,11 +277,13 @@ export interface ProfileOverviewResponse {
   heatmap_days: HeatmapDayEntry[];
   insights: {
     top_model?: TopStatEntry | null;
+    model_breakdown?: ModelBreakdownEntry[];
     top_effort?: TopStatEntry | null;
     routing_mode: RoutingMode;
     active_projects: number;
     total_commands: number;
     unique_changed_files: number;
+    worktree_count?: number;
   };
   recent_sessions: OverviewSessionRow[];
   hot_files: HotFileEntry[];

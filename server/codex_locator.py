@@ -1,8 +1,9 @@
-"""Cross-platform (Windows-first) OpenAI Codex CLI binary locator."""
+"""Locate the OpenAI Codex CLI on Windows, macOS, and Linux."""
 
 from __future__ import annotations
 
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -17,7 +18,7 @@ class CodexBinaryNotFoundError(FileNotFoundError):
 
 
 def _version_sort_key(path: Path) -> tuple[int, int, int, float]:
-    match = _VERSION_RE.search(str(path))
+    match = next((m for part in reversed(path.parts) if (m := _VERSION_RE.search(part))), None)
     if match:
         ver = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
     else:
@@ -76,41 +77,45 @@ def _discover_windows_appx_codex() -> list[Path]:
 
 def _discover_local_fallback_codex() -> list[Path]:
     home = Path.home()
-    candidates: list[Path] = []
-
-    if sys.platform == "win32":
-        direct = [
-            home / ".codex" / "plugins" / ".plugin-appserver" / "codex.exe",
-            home / ".codex" / ".sandbox-bin" / "codex.exe",
-        ]
-        for p in direct:
-            if p.is_file():
-                candidates.append(p)
-
-        for ext_root in (
-            home / ".vscode" / "extensions",
-            home / ".cursor" / "extensions",
-            home / ".antigravity" / "extensions",
-        ):
-            if not ext_root.is_dir():
-                continue
-            try:
-                ext_bins = sorted(
-                    ext_root.glob("openai.chatgpt-*/bin/windows-x86_64/codex.exe"),
-                    key=_version_sort_key,
-                    reverse=True,
-                )
-                candidates.extend(p for p in ext_bins if p.is_file())
-            except OSError:
-                continue
-    else:
-        for p in (
-            home / ".codex" / "plugins" / ".plugin-appserver" / "codex",
-            home / ".codex" / ".sandbox-bin" / "codex",
+    windows = sys.platform == "win32"
+    executable = "codex.exe" if windows else "codex"
+    direct = [
+        home / ".codex" / "plugins" / ".plugin-appserver" / executable,
+        home / ".codex" / ".sandbox-bin" / executable,
+    ]
+    if not windows:
+        if sys.platform == "darwin":
+            app_binary = Path("Codex.app/Contents/Resources/codex")
+            direct.extend((Path("/Applications") / app_binary, home / "Applications" / app_binary))
+        direct.extend((
+            Path("/opt/homebrew/bin/codex"),
+            Path("/usr/local/bin/codex"),
+            home / ".npm-global" / "bin" / "codex",
             home / ".local" / "bin" / "codex",
-        ):
-            if p.is_file():
-                candidates.append(p)
+        ))
+    candidates = [p for p in direct if p.is_file() and (windows or os.access(p, os.X_OK))]
+
+    machine = platform.machine().lower()
+    arch = {"amd64": "x86_64", "arm64": "aarch64"}.get(machine, machine)
+    platform_name = "windows" if windows else sys.platform
+    alias = {"aarch64": "arm64", "x86_64": "x64"}.get(arch)
+    targets = [f"{platform_name}-{arch}"]
+    if alias:
+        targets.append(f"{platform_name}-{alias}")
+    if windows and arch != "x86_64":
+        targets.append("windows-x86_64")
+
+    for extension_dir in (".vscode", ".vscode-insiders", ".cursor", ".antigravity"):
+        ext_root = home / extension_dir / "extensions"
+        try:
+            ext_bins = sorted(
+                (p for target in targets for p in ext_root.glob(f"openai.chatgpt-*/bin/{target}/{executable}")),
+                key=_version_sort_key,
+                reverse=True,
+            )
+            candidates.extend(p for p in ext_bins if p.is_file() and (windows or os.access(p, os.X_OK)))
+        except OSError:
+            continue
 
     return candidates
 
@@ -123,7 +128,7 @@ def locate_codex_binary(explicit: str | Path | None = None) -> Path:
     2. `CODEX_ORBIT_CODEX_BIN` environment variable
     3. `PATH` lookup (`codex` / `codex.exe` / `codex.cmd`)
     4. Windows Store `OpenAI.Codex*\\app\\resources\\codex.exe`
-    5. Local Codex Desktop / VS Code extension bundled `codex.exe`
+    5. Local app bundles, package manager paths, and editor extensions
     """
     checked: list[str] = []
 
@@ -142,7 +147,8 @@ def locate_codex_binary(explicit: str | Path | None = None) -> Path:
             f"CODEX_ORBIT_CODEX_BIN points to a missing file: {p}"
         )
 
-    for cmd_name in ("codex", "codex.exe", "codex.cmd"):
+    names = ("codex", "codex.exe", "codex.cmd") if sys.platform == "win32" else ("codex",)
+    for cmd_name in names:
         hit = shutil.which(cmd_name)
         if hit:
             return Path(hit).resolve()
@@ -157,7 +163,7 @@ def locate_codex_binary(explicit: str | Path | None = None) -> Path:
     fallbacks = _discover_local_fallback_codex()
     if fallbacks:
         return fallbacks[0]
-    checked.append("~/.codex & IDE extension bundled codex binaries")
+    checked.append("Codex Desktop, local install paths, and editor extensions")
 
     raise CodexBinaryNotFoundError(
         "Unable to locate local Codex CLI executable. Checked: "

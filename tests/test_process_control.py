@@ -30,6 +30,7 @@ time.sleep(60)
     child_proc = subprocess.Popen(
         [sys.executable, str(child_script)],
         creationflags=creationflags,
+        start_new_session=sys.platform != "win32",
     )
     try:
         deadline = time.monotonic() + 5.0

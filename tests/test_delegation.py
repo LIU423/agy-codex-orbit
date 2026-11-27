@@ -11,9 +11,11 @@ from pathlib import Path
 
 import pytest
 
+from server import delegate_cli
 from server.codex_locator import CodexBinaryNotFoundError, locate_codex_binary
 from server.delegate_cli import parse_args, run_delegation
 from server.delegation_store import DelegationStore
+from server.routing_policy import save_settings
 from server.session_store import SessionStore
 
 FIXTURE_PATH = (
@@ -94,6 +96,58 @@ def test_codex_locator_explicit_and_env(tmp_path: Path, monkeypatch: pytest.Monk
         locate_codex_binary(tmp_path / "missing-codex.exe")
 
 
+@pytest.mark.parametrize(
+    "enabled, flags, expected_model, expected_probe",
+    [
+        (True, [], "custom-default", True),
+        (True, ["--model", "explicit-model"], "explicit-model", False),
+        (True, ["--dry-run"], "custom-escalation", False),
+        (False, [], "custom-escalation", False),
+    ],
+)
+def test_live_max_guardrail_only_checks_automatic_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    flags: list[str],
+    expected_model: str,
+    expected_probe: bool,
+) -> None:
+    data_dir = tmp_path / "plugin-data"
+    save_settings(
+        data_dir, routing_mode="silent_best", default_model="custom-default",
+        escalation_model="custom-escalation", quota_guardrail_enabled=enabled,
+    )
+    sid = "99999999-aaaa-bbbb-cccc-dddddddddddd"
+    fake_codex = _create_fake_codex_cmd(tmp_path, sid)
+    probes: list[Path] = []
+
+    def query(*, codex_bin: Path) -> dict:
+        probes.append(codex_bin)
+        return {"codex": {"available": True, "primary": {"remaining_percent": 0}}}
+
+    monkeypatch.setattr(delegate_cli, "query_codex_quota", query)
+    code, result = run_delegation(
+        parse_args([
+            "--cwd", str(tmp_path), "--mode", "read-only", "--task-tier", "complex",
+            "--prompt", "Verify selected model", "--codex-bin", str(fake_codex),
+            "--data-dir", str(data_dir), "--no-desktop-project-sync", *flags,
+        ])
+    )
+    assert code == 0
+    assert result["model"] == expected_model
+    assert result["reasoning_effort"] == "xhigh"
+    assert probes == ([fake_codex.resolve()] if expected_probe else [])
+
+    if "--dry-run" in flags:
+        assert result["command"][result["command"].index("-m") + 1] == expected_model
+    else:
+        assert result["guardrail_triggered"] is expected_probe
+        record = DelegationStore(data_dir).get_by_session_id(sid)
+        assert record is not None
+        assert record.rounds[0].model == expected_model
+
+
 def test_delegate_cli_worktree_isolation_and_multi_turn_resume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -171,6 +225,55 @@ def test_delegate_cli_worktree_isolation_and_multi_turn_resume(
     assert len(rec.rounds) == 2
     assert [r.round_index for r in rec.rounds] == [1, 2]
     assert rec.rounds[0].source_model == "Gemini 2.5 Pro"
+
+
+@pytest.mark.parametrize("codex_available", [True, False])
+def test_delegate_cli_reuses_registered_followup_and_deletes_prompt_file(
+    tmp_path: Path, codex_available: bool,
+) -> None:
+    session_id = "99999999-aaaa-bbbb-cccc-dddddddddddd"
+    data_dir = tmp_path / "plugin-data"
+    store = DelegationStore(data_dir)
+    prompt = "Continue with café\nand summarize."
+    prompt_path = tmp_path / "prompt.txt"
+    prompt_path.write_text(prompt, encoding="utf-8")
+    for run_id in ("run-original", "run-followup"):
+        store.start_round(
+            run_id=run_id,
+            session_id=session_id,
+            workspace_dir=str(tmp_path),
+            prompt=prompt,
+            isolation_mode="workspace-write",
+            source_model="Orbit",
+        )
+    store.update_round("run-original", status="completed", ended=True)
+
+    fake_codex = _create_fake_codex_cmd(tmp_path, session_id) if codex_available else tmp_path / "missing.exe"
+    code, summary = run_delegation(parse_args([
+        "--session-id", session_id, "--run-id", "run-followup", "--cwd", str(tmp_path),
+        "--prompt-file", str(prompt_path), "--delete-prompt-file", "--data-dir", str(data_dir),
+        "--codex-bin", str(fake_codex), "--source-model", "Orbit", "--no-desktop-project-sync",
+    ]))
+
+    assert not prompt_path.exists()
+    record = store.get_by_session_id(session_id)
+    assert record is not None
+    assert [rnd.run_id for rnd in record.rounds] == ["run-original", "run-followup"]
+    followup = record.rounds[-1]
+    assert followup.round_index == 2
+    assert followup.pid == os.getpid()
+    assert followup.ended_at
+    if codex_available:
+        assert code == 0
+        assert summary["run_id"] == "run-followup"
+        assert followup.status == "completed"
+        assert followup.turn_id == "turn-002"
+        assert followup.model == summary["model"]
+        assert (tmp_path / "round2.txt").read_text(encoding="utf-8") == prompt
+    else:
+        assert code == 2
+        assert followup.status == "failed"
+        assert followup.error_summary == summary["error"]
 
 
 def test_delegate_cli_same_workspace_default_and_effort_flags(

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
+import subprocess
 import sys
+import tempfile
+import threading
 import time
+import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -18,15 +22,23 @@ if str(_REPO_ROOT) not in sys.path:
 from mcp import types
 from mcp.server.mcpserver import MCPServer
 
-from server.codex_desktop import query_codex_quota
-from server.delegation_store import DelegationStore, resolve_data_dir, runtime_pointer_path
+from server.codex_desktop import query_codex_quota, read_codex_model_catalog
+from server.delegation_store import (
+    DelegationStore,
+    _atomic_write_json,
+    prune_idle_worktrees,
+    resolve_data_dir,
+    runtime_pointer_path,
+)
+from server.doctor import run_doctor
 from server.overview_builder import build_profile_overview
 from server.process_control import cancel_delegation
 from server.routing_policy import (
     ROUTING_MODE_LABELS,
-    load_routing_mode,
-    load_ui_locale,
+    OrbitSettings,
+    load_settings,
     save_routing_mode,
+    save_settings,
     save_ui_locale,
 )
 from server.session_store import SessionStore
@@ -70,23 +82,24 @@ def _write_runtime_pointer(data_dir: Path | None) -> None:
         return
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
-        pointer_file = runtime_pointer_path()
-        pointer_file.parent.mkdir(parents=True, exist_ok=True)
-        pointer_file.write_text(
-            json.dumps(
-                {
-                    "data_dir": str(data_dir.resolve()),
-                    "python_bin": str(Path(sys.executable).resolve()),
-                    "delegate_cli": str((_REPO_ROOT / "server" / "delegate_cli.py").resolve()),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        _atomic_write_json(
+            runtime_pointer_path(),
+            {
+                "data_dir": str(data_dir.resolve()),
+                # POSIX venv executables can be symlinks to the base interpreter.
+                "python_bin": str(Path(sys.executable).absolute()),
+                "delegate_cli": str((_REPO_ROOT / "server" / "delegate_cli.py").resolve()),
+            },
         )
     except OSError:
         # Non-fatal: server continues operating with its configured data_dir.
         pass
+
+
+def _reap_followup(process: subprocess.Popen, prompt_path: Path) -> None:
+    process.wait()
+    with suppress(OSError):
+        prompt_path.unlink(missing_ok=True)
 
 
 def create_server(
@@ -109,9 +122,10 @@ def create_server(
     )
     mcp = MCPServer(
         name="Codex Orbit",
-        version="0.6.1",
+        version="0.7.0",
     )
     quota_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+    followup_lock = threading.Lock()
 
     @mcp.resource(
         APP_URI,
@@ -188,14 +202,11 @@ def create_server(
     def orbit_list_sessions(query: str = "", limit: int = 80) -> types.CallToolResult:
         clamped_limit = max(1, min(limit, 200))
         sessions = store.list_sessions(query=query, limit=clamped_limit)
-        active_mode = load_routing_mode(data_dir=resolved_data_dir)
-        ui_locale = load_ui_locale(data_dir=resolved_data_dir)
         payload = {
             "sessions": [s.model_dump(mode="json") for s in sessions],
             "sessions_dir": str(store.sessions_dir),
             "sessions_dir_exists": store.sessions_dir.exists() or len(sessions) > 0,
-            "routing_mode": active_mode,
-            "ui_locale": ui_locale,
+            **load_settings(resolved_data_dir).to_dict(),
         }
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=f"{len(sessions)} sessions")],
@@ -246,6 +257,113 @@ def create_server(
         return types.CallToolResult(
             content=[types.TextContent(type="text", text="ok" if delta else "not found")],
             structured_content=payload,
+        )
+
+    def followup_error(error: str, *, busy: bool = False) -> types.CallToolResult:
+        payload = {"started": False, "error": error}
+        if busy:
+            payload["busy"] = True
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=error)],
+            structured_content=payload,
+        )
+
+    @mcp.tool(
+        name="orbit_send_followup",
+        title="Send follow-up to Codex session",
+        meta=APP_ONLY_META,
+        structured_output=False,
+    )
+    def orbit_send_followup(
+        session_id: str,
+        prompt: str,
+        web_search: bool = False,
+    ) -> types.CallToolResult:
+        session_id = session_id.strip()
+        prompt = prompt.strip()
+        if not session_id:
+            return followup_error("Session ID is required.")
+        if not prompt:
+            return followup_error("Prompt is required.")
+
+        with followup_lock:
+            detail, _ = store.get_session_detail(session_id)
+            if detail is None or detail.summary.session_id != session_id:
+                return followup_error("Session not found.")
+
+            existing = delegation_store.get_by_session_id(session_id)
+            if detail.summary.status == "running" or (
+                existing and any(round_rec.status == "running" for round_rec in existing.rounds)
+            ):
+                return followup_error("Session already has a running task.", busy=True)
+            if existing and existing.session_id is None:
+                return followup_error("Session not found.")
+
+            workspace_dir = None
+            for raw_path in (detail.summary.project_dir, existing.workspace_dir if existing else None):
+                if not raw_path or not raw_path.strip():
+                    continue
+                with suppress(OSError, RuntimeError, ValueError):
+                    candidate = Path(raw_path).expanduser()
+                    if candidate.drive and str(candidate) == candidate.drive:
+                        candidate = Path(candidate.drive + os.sep)
+                    if candidate.is_dir():
+                        workspace_dir = candidate.resolve()
+                        break
+            if workspace_dir is None:
+                return followup_error("Session workspace directory does not exist.")
+
+            isolation_mode = (existing.isolation_mode if existing else detail.summary.isolation_mode) or "workspace-write"
+            run_id = f"run-{uuid.uuid4().hex[:10]}"
+            prompt_path = None
+            round_created = False
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", prefix="codex-orbit-", suffix=".prompt", delete=False,
+                ) as prompt_file:
+                    prompt_path = Path(prompt_file.name)
+                    prompt_file.write(prompt)
+
+                delegation_store.start_round(
+                    run_id=run_id,
+                    session_id=session_id,
+                    workspace_dir=str(workspace_dir),
+                    prompt=prompt,
+                    isolation_mode=isolation_mode,
+                    source_model="Orbit",
+                    title=detail.summary.title,
+                )
+                round_created = True
+                command = [
+                    sys.executable, "-u", str(_REPO_ROOT / "server" / "delegate_cli.py"),
+                    "--session-id", session_id, "--cwd", str(workspace_dir),
+                    "--mode", isolation_mode, "--data-dir", str(resolved_data_dir),
+                    "--source-model", "Orbit", "--run-id", run_id,
+                    "--prompt-file", str(prompt_path), "--delete-prompt-file", "--no-desktop-project-sync",
+                ]
+                if web_search:
+                    command.append("--web-search")
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
+                    start_new_session=sys.platform != "win32",
+                )
+            except (OSError, UnicodeError) as exc:
+                error = f"Could not start follow-up: {exc}"
+                if prompt_path is not None:
+                    with suppress(OSError):
+                        prompt_path.unlink(missing_ok=True)
+                if round_created:
+                    delegation_store.update_round(run_id, status="failed", error_summary=error, ended=True)
+                return followup_error(error)
+
+            threading.Thread(target=_reap_followup, args=(process, prompt_path), daemon=True).start()
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text="Follow-up started.")],
+            structured_content={"started": True, "session_id": session_id, "run_id": run_id},
         )
 
     @mcp.tool(
@@ -317,7 +435,7 @@ def create_server(
     @mcp.tool(
         name="orbit_set_ui_locale",
         title="Set Codex Orbit UI language",
-        description="App-only tool: persist UI language preference (auto, zh, en, ja).",
+        description="App-only tool: persist UI language preference (auto, zh-CN, zh-TW, en, ja).",
         meta=APP_ONLY_META,
         structured_output=False,
     )
@@ -326,6 +444,78 @@ def create_server(
         return types.CallToolResult(
             content=[types.TextContent(type="text", text=saved)],
             structured_content={"ui_locale": saved},
+        )
+
+    def settings_result(settings: OrbitSettings) -> types.CallToolResult:
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text="Codex Orbit settings")],
+            structured_content={
+                **settings.to_dict(),
+                "available_models": read_codex_model_catalog(store.sessions_dir.parent),
+            },
+        )
+
+    @mcp.tool(
+        name="orbit_get_settings",
+        title="Get Codex Orbit settings",
+        meta=APP_ONLY_META,
+        structured_output=False,
+    )
+    def orbit_get_settings() -> types.CallToolResult:
+        return settings_result(load_settings(resolved_data_dir))
+
+    @mcp.tool(
+        name="orbit_update_settings",
+        title="Update Codex Orbit settings",
+        description="Update the supplied settings. Pass an empty model name to restore its default.",
+        meta=APP_ONLY_META,
+        structured_output=False,
+    )
+    def orbit_update_settings(
+        routing_mode: str | None = None,
+        ui_locale: str | None = None,
+        default_model: str | None = None,
+        escalation_model: str | None = None,
+        quota_guardrail_enabled: bool | None = None,
+        quota_guardrail_threshold_pct: int | None = None,
+    ) -> types.CallToolResult:
+        updates = {
+            "routing_mode": routing_mode,
+            "ui_locale": ui_locale,
+            "default_model": default_model,
+            "escalation_model": escalation_model,
+            "quota_guardrail_enabled": quota_guardrail_enabled,
+            "quota_guardrail_threshold_pct": quota_guardrail_threshold_pct,
+        }
+        fields = {name: value for name, value in updates.items() if value is not None}
+        settings = save_settings(resolved_data_dir, **fields) if fields else load_settings(resolved_data_dir)
+        return settings_result(settings)
+
+    @mcp.tool(
+        name="orbit_run_doctor",
+        title="Run Codex Orbit diagnostics",
+        meta=APP_ONLY_META,
+        structured_output=False,
+    )
+    def orbit_run_doctor() -> types.CallToolResult:
+        report = run_doctor(data_dir=resolved_data_dir, codex_home=store.sessions_dir.parent)
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text="Codex Orbit diagnostics")],
+            structured_content=report,
+        )
+
+    @mcp.tool(
+        name="orbit_prune_worktrees",
+        title="Prune idle Codex Orbit worktrees",
+        description="Remove idle delegation worktrees and their uncommitted files. Running delegations are skipped.",
+        meta=APP_ONLY_META,
+        structured_output=False,
+    )
+    def orbit_prune_worktrees() -> types.CallToolResult:
+        result = prune_idle_worktrees(delegation_store)
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=f"Removed {len(result['removed'])} worktrees")],
+            structured_content=result,
         )
 
     @mcp.tool(

@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from server.delegation_store import DelegationStore
 from server.routing_policy import RoutingMode, load_routing_mode
 from server.session_store import SessionStore
 
@@ -193,6 +194,7 @@ def build_profile_overview(
     )
 
     model_counts: Counter[str] = Counter()
+    model_tokens: Counter[str] = Counter()
     effort_counts: Counter[str] = Counter()
     file_sessions: dict[str, set[str]] = defaultdict(set)
     file_display: dict[str, str] = {}
@@ -228,6 +230,7 @@ def build_profile_overview(
 
         if s.model:
             model_counts[s.model] += 1
+            model_tokens[s.model] += tokens
         if s.reasoning_effort:
             effort_counts[s.reasoning_effort] += 1
 
@@ -273,6 +276,7 @@ def build_profile_overview(
             direct_tokens_total += tokens
         if h["model"]:
             model_counts[h["model"]] += 1
+            model_tokens[h["model"]] += tokens
         if h["reasoning_effort"]:
             effort_counts[h["reasoning_effort"]] += 1
         day = h["date"]
@@ -322,6 +326,26 @@ def build_profile_overview(
         for fk, sids in ranked_files
     ]
 
+    ranked_models = sorted(
+        model_counts, key=lambda model: (-model_counts[model], -model_tokens[model], model)
+    )[:6]
+    known_model_sessions = sum(model_counts.values())
+    model_breakdown = [
+        {
+            "name": model,
+            "count": model_counts[model],
+            "share_pct": round(100 * model_counts[model] / known_model_sessions, 1),
+            "tokens": model_tokens[model],
+        }
+        for model in ranked_models
+    ]
+
+    worktrees_dir = DelegationStore(data_dir).worktrees_dir
+    try:
+        worktree_count = sum(path.is_dir() for path in worktrees_dir.iterdir())
+    except OSError:
+        worktree_count = 0
+
     routing_mode: RoutingMode = load_routing_mode(data_dir=data_dir)
 
     return {
@@ -351,11 +375,13 @@ def build_profile_overview(
         "heatmap_days": heatmap_days,
         "insights": {
             "top_model": _top_stat(model_counts),
+            "model_breakdown": model_breakdown,
             "top_effort": _top_stat(effort_counts),
             "routing_mode": routing_mode,
             "active_projects": len(project_counts),
             "total_commands": total_commands,
             "unique_changed_files": len(file_sessions),
+            "worktree_count": worktree_count,
         },
         "recent_sessions": recent_items,
         "hot_files": hot_files,

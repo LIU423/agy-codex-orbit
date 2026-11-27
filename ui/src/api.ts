@@ -1,8 +1,11 @@
 import type { App } from "@modelcontextprotocol/ext-apps";
 import type {
   CancelDelegationResult,
+  DoctorReport,
   ListSessionsResponse,
+  OrbitSettingsResponse,
   ProfileOverviewResponse,
+  PruneWorktreesResult,
   QuotaStatus,
   RoutingMode,
   SessionDelta,
@@ -130,5 +133,44 @@ export class OrbitApi {
       arguments: { project_dir: projectDir },
     });
     return extractPayload<ProfileOverviewResponse>(res as ToolCallResultLike);
+  }
+
+  async getSettings(): Promise<OrbitSettingsResponse> {
+    const res = await this.app.callServerTool({
+      name: "orbit_get_settings",
+      arguments: {},
+    });
+    return extractPayload<OrbitSettingsResponse>(res as ToolCallResultLike);
+  }
+
+  async updateSettings(patch: {
+    routing_mode?: RoutingMode;
+    ui_locale?: UiLocale;
+    default_model?: string;
+    escalation_model?: string;
+    quota_guardrail_enabled?: boolean;
+    quota_guardrail_threshold_pct?: number;
+  }): Promise<OrbitSettingsResponse> {
+    const res = await this.app.callServerTool({
+      name: "orbit_update_settings",
+      arguments: patch,
+    });
+    return extractPayload<OrbitSettingsResponse>(res as ToolCallResultLike);
+  }
+
+  async runDoctor(): Promise<DoctorReport> {
+    const res = await this.app.callServerTool({
+      name: "orbit_run_doctor",
+      arguments: {},
+    });
+    return extractPayload<DoctorReport>(res as ToolCallResultLike);
+  }
+
+  async pruneWorktrees(): Promise<PruneWorktreesResult> {
+    const res = await this.app.callServerTool({
+      name: "orbit_prune_worktrees",
+      arguments: {},
+    });
+    return extractPayload<PruneWorktreesResult>(res as ToolCallResultLike);
   }
 }

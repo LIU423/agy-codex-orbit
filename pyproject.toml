@@ -1,10 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "agy-codex-orbit"
 version = "0.1.0"
 description = "Google Antigravity 2.0 native MCP App plugin for OpenAI Codex delegation and zero-token live monitoring"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.25.0",
+    "mcp>=2.0,<3",
     "pydantic>=2.10.0",
 ]
 
@@ -12,6 +16,9 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
 ]
+
+[tool.setuptools]
+packages = ["server"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

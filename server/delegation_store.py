@@ -5,8 +5,11 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import shutil
+import subprocess
 import sys
 import uuid
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +19,8 @@ from server.models import (
     DelegationStatus,
     IsolationMode,
 )
+
+FOLLOWUP_STARTUP_GRACE_SECONDS = 10
 
 
 def utc_now_iso() -> str:
@@ -43,10 +48,23 @@ def resolve_data_dir(explicit: Path | str | None = None) -> Path:
             data = json.loads(ptr.read_text(encoding="utf-8"))
             if isinstance(data, dict) and isinstance(data.get("data_dir"), str) and data["data_dir"].strip():
                 return Path(data["data_dir"]).expanduser().resolve()
-        except (OSError, json.JSONDecodeError):
+        except (OSError, RuntimeError, ValueError):
             pass
 
     return runtime_pointer_path().parent / "data"
+
+
+def run_git(cwd: Path, args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
+    )
 
 
 def is_process_alive(pid: int | None) -> bool:
@@ -80,8 +98,12 @@ def is_process_alive(pid: int | None) -> bool:
 def _atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp_path, path)
+    try:
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, path)
+    finally:
+        with suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
 
 
 class DelegationStore:
@@ -123,6 +145,12 @@ class DelegationStore:
         changed = False
         for rnd in record.rounds:
             if rnd.status == "running":
+                if rnd.source_model == "Orbit" and rnd.pid is None and rnd.child_pid is None:
+                    # App follow-ups are visible before the wrapper has registered its PID.
+                    with suppress(ValueError):
+                        started_at = datetime.fromisoformat(rnd.started_at).timestamp()
+                        if datetime.now(timezone.utc).timestamp() - started_at < FOLLOWUP_STARTUP_GRACE_SECONDS:
+                            continue
                 alive = is_process_alive(rnd.child_pid) or is_process_alive(rnd.pid)
                 if not alive:
                     rnd.status = "failed"
@@ -296,7 +324,12 @@ class DelegationStore:
         self,
         run_id: str,
         *,
+        pid: int | None = None,
         child_pid: int | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        worktree_path: str | None = None,
+        worktree_branch: str | None = None,
         turn_id: str | None = None,
         status: DelegationStatus | None = None,
         exit_code: int | None = None,
@@ -314,8 +347,18 @@ class DelegationStore:
         if target_round is None:
             return None
 
+        if pid is not None:
+            target_round.pid = pid
         if child_pid is not None:
             target_round.child_pid = child_pid
+        if model is not None:
+            target_round.model = model
+        if reasoning_effort is not None:
+            target_round.reasoning_effort = reasoning_effort
+        if worktree_path is not None:
+            target_round.worktree_path = rec.worktree_path = worktree_path
+        if worktree_branch is not None:
+            target_round.worktree_branch = rec.worktree_branch = worktree_branch
         if turn_id is not None:
             target_round.turn_id = turn_id
         if status is not None:
@@ -336,3 +379,96 @@ class DelegationStore:
             target_round.ended_at = utc_now_iso()
 
         return self._save(rec)
+
+
+def _remove_git_worktree(path: Path, workspace_dir: str | None) -> str | None:
+    remove_args = ["worktree", "remove", "--force", "--", str(path)]
+    workspace = Path(workspace_dir) if workspace_dir else None
+    linked = (path / ".git").is_file()
+    try:
+        if workspace and workspace.is_dir():
+            result = run_git(workspace, remove_args)
+            if result.returncode == 0:
+                return None
+            if linked:
+                workspace_error = (result.stderr or result.stdout).strip()
+            else:
+                return None
+        else:
+            workspace_error = ""
+
+        if not linked:
+            return None
+
+        # Recover the parent repository for an orphaned worktree or a moved workspace.
+        common = run_git(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        git_dir = Path(common.stdout.strip())
+        if common.returncode or not git_dir.is_absolute() or git_dir.is_relative_to(path):
+            return workspace_error or (common.stderr or common.stdout).strip() or "Cannot find the parent Git repository."
+
+        result = run_git(git_dir.parent, ["--git-dir", str(git_dir), *remove_args])
+        if result.returncode:
+            return (result.stderr or result.stdout).strip() or "Git worktree removal failed."
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        if linked:
+            return str(exc)
+    return None
+
+
+def prune_idle_worktrees(store: DelegationStore) -> dict[str, list[str]]:
+    """Remove idle worktree directories from the plugin's managed worktree root."""
+    result: dict[str, list[str]] = {"removed": [], "skipped_running": [], "errors": []}
+    root = store.worktrees_dir
+    try:
+        if root.resolve(strict=True) != root:
+            result["errors"].append(f"{root}: Worktree root resolves outside its managed path.")
+            return result
+        candidates = sorted(root.iterdir())
+    except FileNotFoundError:
+        return result
+    except (OSError, RuntimeError) as exc:
+        result["errors"].append(f"{root}: {exc}")
+        return result
+
+    workspaces: dict[Path, str] = {}
+    running: set[Path] = set()
+    for record in store.load_all(verify_liveness=False):
+        paths = [(record.worktree_path, record.workspace_dir)]
+        paths.extend((round_record.worktree_path, round_record.workspace_dir) for round_record in record.rounds)
+        active = any(round_record.status == "running" for round_record in record.rounds)
+        for raw_path, workspace in paths:
+            if not raw_path:
+                continue
+            try:
+                path = Path(raw_path).resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if workspace:
+                workspaces.setdefault(path, workspace)
+            if active:
+                running.add(path)
+
+    for path in candidates:
+        try:
+            if not path.is_dir():
+                continue
+            if path.resolve(strict=True) != path:
+                result["errors"].append(f"{path}: Worktree directory resolves outside its managed path.")
+                continue
+            if path in running:
+                result["skipped_running"].append(str(path))
+                continue
+
+            git_error = _remove_git_worktree(path, workspaces.get(path))
+            if path.is_dir():
+                if path.resolve(strict=True) != path:
+                    raise RuntimeError("Worktree directory resolves outside its managed path.")
+                shutil.rmtree(path)
+            result["removed"].append(str(path))
+            if git_error:
+                result["errors"].append(f"{path}: {git_error}")
+        except FileNotFoundError:
+            continue
+        except (OSError, RuntimeError) as exc:
+            result["errors"].append(f"{path}: {exc}")
+    return result

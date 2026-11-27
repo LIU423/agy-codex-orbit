@@ -22,8 +22,10 @@ import "./styles.css";
 import type {
   AssistantBlock,
   CommandRecord,
+  DoctorReport,
   FileChangeRecord,
   HeatmapMetric,
+  ModelCatalogEntry,
   OpenOrbitBootstrap,
   OriginFilter,
   ProfileOverviewResponse,
@@ -70,6 +72,15 @@ interface UiState {
   routingMode: RoutingMode;
   uiLocale: UiLocale;
   hostLocale: string | null;
+  defaultModel: string;
+  escalationModel: string;
+  quotaGuardrailEnabled: boolean;
+  quotaGuardrailThresholdPct: number;
+  availableModels: ModelCatalogEntry[];
+  settingsOpen: boolean;
+  doctorReport: DoctorReport | null;
+  runningDoctor: boolean;
+  pruningWorktrees: boolean;
 }
 
 const state: UiState = {
@@ -106,6 +117,15 @@ const state: UiState = {
   routingMode: "ask",
   uiLocale: "auto",
   hostLocale: null,
+  defaultModel: "gpt-6.2-sol",
+  escalationModel: "gpt-6.2-astra",
+  quotaGuardrailEnabled: true,
+  quotaGuardrailThresholdPct: 15,
+  availableModels: [],
+  settingsOpen: false,
+  doctorReport: null,
+  runningDoctor: false,
+  pruningWorktrees: false,
 };
 
 const toggleAuxPaneResultSchema = z.object({ isError: z.boolean().optional() }).passthrough();
@@ -161,7 +181,7 @@ function findBestRunningSession(
 
 function applyLocaleToDocument(): void {
   const loc = activeLocale();
-  document.documentElement.lang = loc === "zh" ? "zh-CN" : loc === "ja" ? "ja" : "en";
+  document.documentElement.lang = loc;
   document.documentElement.dataset.lang = loc;
   updateSidebarChrome();
 }
@@ -398,7 +418,8 @@ function renderLocaleSelect(): string {
   const str = getStrings(loc);
   const opts: Array<{ value: UiLocale; label: string }> = [
     { value: "auto", label: str.languageAuto },
-    { value: "zh", label: "中文" },
+    { value: "zh-CN", label: "简体中文" },
+    { value: "zh-TW", label: "繁體中文" },
     { value: "en", label: "EN" },
     { value: "ja", label: "日本語" },
   ];
@@ -411,6 +432,101 @@ function renderLocaleSelect(): string {
   return `<select id="sel-ui-locale" class="ctrl-select" aria-label="${escapeHtml(str.languageAria)}" title="${escapeHtml(str.languageAria)}">${optionsHtml}</select>`;
 }
 
+function renderModelOptions(selectedSlug: string): string {
+  const seen = new Set<string>();
+  const items: Array<{ slug: string; label: string }> = [];
+  for (const m of state.availableModels) {
+    if (!m.slug || seen.has(m.slug)) continue;
+    seen.add(m.slug);
+    items.push({
+      slug: m.slug,
+      label: m.display_name && m.display_name !== m.slug ? `${m.display_name} (${m.slug})` : m.slug,
+    });
+  }
+  if (selectedSlug && !seen.has(selectedSlug)) {
+    items.unshift({ slug: selectedSlug, label: selectedSlug });
+  }
+  return items
+    .map(
+      (item) =>
+        `<option value="${escapeHtml(item.slug)}"${item.slug === selectedSlug ? " selected" : ""}>${escapeHtml(item.label)}</option>`,
+    )
+    .join("");
+}
+
+function renderSettingsPopover(): string {
+  const loc = activeLocale();
+  const str = getStrings(loc);
+  const thresholds = Array.from(new Set([10, 15, 20, 30, state.quotaGuardrailThresholdPct])).sort((a, b) => a - b);
+  const thresholdOpts = thresholds
+    .map(
+      (v) =>
+        `<option value="${v}"${state.quotaGuardrailThresholdPct === v ? " selected" : ""}>&lt; ${v}%</option>`,
+    )
+    .join("");
+
+  let doctorHtml = "";
+  if (state.doctorReport) {
+    const hasWarn = state.doctorReport.checks.some((c) => c.status === "warning");
+    const statusCls = !state.doctorReport.ok ? "error" : hasWarn ? "warning" : "ok";
+    const statusSummary = !state.doctorReport.ok
+      ? str.doctorHasErrors
+      : hasWarn
+        ? str.doctorHasWarnings
+        : str.doctorAllOk;
+    doctorHtml = `
+      <div class="doctor-summary ${statusCls}">${escapeHtml(statusSummary)}</div>
+      <div class="doctor-list">
+        ${state.doctorReport.checks
+          .map(
+            (c) => `
+              <div class="doctor-item" title="${escapeHtml(c.detail)}">
+                <span class="doctor-pill ${c.status}">${escapeHtml(c.status)}</span>
+                <div class="doctor-item-text">
+                  <div class="doctor-item-id">${escapeHtml(c.id)}</div>
+                  <div class="doctor-item-msg">${escapeHtml(c.summary)}</div>
+                </div>
+              </div>`,
+          )
+          .join("")}
+      </div>`;
+  }
+
+  const worktreeCount = state.overview?.insights.worktree_count ?? 0;
+
+  return `
+    <div class="settings-popover" id="settings-popover" role="dialog" aria-label="${escapeHtml(str.settingsTitle)}">
+      <div class="settings-header">
+        <span class="settings-title">${escapeHtml(str.settingsTitle)}</span>
+        <button class="icon-btn" id="btn-close-settings" type="button" aria-label="Close">×</button>
+      </div>
+      <div class="settings-section">
+        <label class="settings-field">
+          <span>${escapeHtml(str.defaultModelLabel)}</span>
+          <select id="sel-default-model" class="ctrl-select">${renderModelOptions(state.defaultModel)}</select>
+        </label>
+        <label class="settings-field">
+          <span>${escapeHtml(str.escalationModelLabel)}</span>
+          <select id="sel-escalation-model" class="ctrl-select">${renderModelOptions(state.escalationModel)}</select>
+        </label>
+        <div class="settings-inline-row">
+          <label class="toggle-label">
+            <input id="chk-guardrail" type="checkbox" ${state.quotaGuardrailEnabled ? "checked" : ""} />
+            <span>${escapeHtml(str.guardrailLabel)}</span>
+          </label>
+          <select id="sel-guardrail-threshold" class="ctrl-select" aria-label="${escapeHtml(str.guardrailThresholdLabel)}"${state.quotaGuardrailEnabled ? "" : " disabled"}>${thresholdOpts}</select>
+        </div>
+      </div>
+      <div class="settings-section">
+        <div class="settings-actions-row">
+          <button class="action-btn" id="btn-run-doctor" type="button"${state.runningDoctor ? " disabled" : ""}>${escapeHtml(state.runningDoctor ? str.runningDoctor : str.runDoctorBtn)}</button>
+          <button class="action-btn" id="btn-prune-worktrees" type="button"${state.pruningWorktrees ? " disabled" : ""}>${escapeHtml(state.pruningWorktrees ? str.pruningWorktrees : str.pruneWorktreesBtn)}${worktreeCount > 0 ? ` (${worktreeCount})` : ""}</button>
+        </div>
+        ${doctorHtml}
+      </div>
+    </div>`;
+}
+
 function renderQuotaBadge(): string {
   const loc = activeLocale();
   const str = getStrings(loc);
@@ -418,11 +534,16 @@ function renderQuotaBadge(): string {
   if (!q || !q.available) return "";
   const parts: string[] = [];
   const tipLines: string[] = [];
+  let warnClass = "";
   if (q.primary) {
     parts.push(`5h ${Math.round(q.primary.remaining_percent)}%`);
     tipLines.push(
       str.quota5hTip(q.primary.remaining_percent, q.primary.resets_at_local || q.primary.resets_in || "-"),
     );
+    if (state.quotaGuardrailEnabled && q.primary.remaining_percent < state.quotaGuardrailThresholdPct) {
+      warnClass = q.primary.remaining_percent < 5 ? " critical" : " warn";
+      tipLines.push(str.quotaLowWarning(state.quotaGuardrailThresholdPct));
+    }
   }
   if (q.secondary) {
     parts.push(`7d ${Math.round(q.secondary.remaining_percent)}%`);
@@ -435,7 +556,7 @@ function renderQuotaBadge(): string {
   }
   tipLines.push(str.antigravityQuotaNote);
   if (parts.length === 0) return "";
-  return `<button class="quota-badge" id="btn-refresh-quota" type="button" title="${escapeHtml(tipLines.join("\n"))}">${escapeHtml(parts.join(" · "))}</button>`;
+  return `<button class="quota-badge${warnClass}" id="btn-refresh-quota" type="button" title="${escapeHtml(tipLines.join("\n"))}">${escapeHtml(parts.join(" · "))}</button>`;
 }
 
 function renderTopbar(): string {
@@ -477,8 +598,10 @@ function renderTopbar(): string {
         ${renderLocaleSelect()}
         ${syncBadgeHtml}
         ${followToggle}
+        <button class="icon-btn topbar-icon${state.settingsOpen ? " active" : ""}" id="btn-settings" type="button" aria-label="${escapeHtml(str.settingsAria)}" title="${escapeHtml(str.settingsAria)}" aria-expanded="${state.settingsOpen}">⚙</button>
       </div>
-    </header>`;
+    </header>
+    ${state.settingsOpen ? renderSettingsPopover() : ""}`;
 }
 
 function renderProfileOverviewPane(): string {
@@ -589,6 +712,38 @@ function renderProfileOverviewPane(): string {
       </button>`
     : "";
 
+  const breakdown = ov.insights.model_breakdown ?? [];
+  const breakdownHtml =
+    breakdown.length > 0
+      ? `
+            <div class="insight-row">
+              <span class="insight-key">${escapeHtml(str.insightModelBreakdown)}</span>
+              <div class="insight-val insight-val-stack">
+                <span>${escapeHtml(breakdown.slice(0, 3).map((m) => `${m.name} ${Math.round(m.share_pct)}%`).join(" · "))}</span>
+                ${
+                  breakdown.length > 1
+                    ? `<div class="model-dist-bar" aria-hidden="true">${breakdown
+                        .slice(0, 4)
+                        .map(
+                          (m, idx) =>
+                            `<span class="model-dist-seg seg-${idx}" style="width:${Math.max(2, m.share_pct)}%" title="${escapeHtml(`${m.name}: ${m.count} (${m.share_pct}%)`)}"></span>`,
+                        )
+                        .join("")}</div>`
+                    : ""
+                }
+              </div>
+            </div>`
+      : "";
+
+  const worktreesHtml =
+    (ov.insights.worktree_count ?? 0) > 0
+      ? `
+            <div class="insight-row">
+              <span class="insight-key">${escapeHtml(str.worktreesCountLabel)}</span>
+              <span class="insight-val">${ov.insights.worktree_count}</span>
+            </div>`
+      : "";
+
   return `
     ${renderTopbar()}
     <div class="overview-scroll">
@@ -666,6 +821,7 @@ function renderProfileOverviewPane(): string {
               <span class="insight-key">${escapeHtml(str.insightTopModel)}</span>
               <span class="insight-val">${escapeHtml(topModelText)}</span>
             </div>
+            ${breakdownHtml}
             <div class="insight-row">
               <span class="insight-key">${escapeHtml(str.insightTopEffort)}</span>
               <span class="insight-val">${escapeHtml(topEffortText)}</span>
@@ -682,6 +838,7 @@ function renderProfileOverviewPane(): string {
               <span class="insight-key">${escapeHtml(str.insightRoutingMode)}</span>
               <span class="insight-val">${escapeHtml(routingModeLabel(state.routingMode, loc))}</span>
             </div>
+            ${worktreesHtml}
           </div>
         </section>
 
@@ -1073,6 +1230,84 @@ async function handleUiLocaleChange(nextLocale: UiLocale): Promise<void> {
   }
 }
 
+async function refreshSettings(): Promise<void> {
+  if (!api) return;
+  try {
+    const s = await api.getSettings();
+    state.routingMode = s.routing_mode;
+    state.uiLocale = s.ui_locale;
+    state.defaultModel = s.default_model;
+    state.escalationModel = s.escalation_model;
+    state.quotaGuardrailEnabled = s.quota_guardrail_enabled;
+    state.quotaGuardrailThresholdPct = s.quota_guardrail_threshold_pct;
+    state.availableModels = s.available_models ?? [];
+    applyLocaleToDocument();
+    detailDirty = true;
+    render();
+  } catch {
+    // Non-fatal: keep defaults when host/tool call fails transiently.
+  }
+}
+
+async function handleUpdateSettings(patch: {
+  default_model?: string;
+  escalation_model?: string;
+  quota_guardrail_enabled?: boolean;
+  quota_guardrail_threshold_pct?: number;
+}): Promise<void> {
+  if (!api) return;
+  const str = getStrings(activeLocale());
+  try {
+    const updated = await api.updateSettings(patch);
+    state.defaultModel = updated.default_model;
+    state.escalationModel = updated.escalation_model;
+    state.quotaGuardrailEnabled = updated.quota_guardrail_enabled;
+    state.quotaGuardrailThresholdPct = updated.quota_guardrail_threshold_pct;
+    state.availableModels = updated.available_models ?? state.availableModels;
+    showToast(str.toastSettingsSaved);
+  } catch (err) {
+    showToast(str.toastSwitchFailed(err instanceof Error ? err.message : String(err)));
+  }
+}
+
+async function handleRunDoctor(): Promise<void> {
+  if (!api || state.runningDoctor) return;
+  state.runningDoctor = true;
+  detailDirty = true;
+  render();
+  try {
+    state.doctorReport = await api.runDoctor();
+  } catch (err) {
+    const str = getStrings(activeLocale());
+    showToast(str.toastSwitchFailed(err instanceof Error ? err.message : String(err)));
+  } finally {
+    state.runningDoctor = false;
+    detailDirty = true;
+    render();
+  }
+}
+
+async function handlePruneWorktrees(): Promise<void> {
+  if (!api || state.pruningWorktrees) return;
+  const str = getStrings(activeLocale());
+  state.pruningWorktrees = true;
+  detailDirty = true;
+  render();
+  try {
+    const res = await api.pruneWorktrees();
+    showToast(str.pruneResultToast(res.removed.length, res.skipped_running.length));
+    if (!state.selectedSessionId) {
+      await refreshProfileOverview();
+    }
+  } catch (err) {
+    showToast(str.toastSwitchFailed(err instanceof Error ? err.message : String(err)));
+  } finally {
+    state.pruningWorktrees = false;
+    detailDirty = true;
+    render();
+  }
+}
+
 function openOverview(): void {
   state.selectedSessionId = null;
   state.detail = null;
@@ -1205,6 +1440,29 @@ function mountShell(): void {
       void refreshQuota(true);
       return;
     }
+    if (target.closest("#btn-settings")) {
+      state.settingsOpen = !state.settingsOpen;
+      if (state.settingsOpen && state.availableModels.length === 0) {
+        void refreshSettings();
+      }
+      detailDirty = true;
+      render();
+      return;
+    }
+    if (target.closest("#btn-close-settings")) {
+      state.settingsOpen = false;
+      detailDirty = true;
+      render();
+      return;
+    }
+    if (target.closest("#btn-run-doctor")) {
+      void handleRunDoctor();
+      return;
+    }
+    if (target.closest("#btn-prune-worktrees")) {
+      void handlePruneWorktrees();
+      return;
+    }
     if (target.closest("#btn-clear-date")) {
       state.selectedHeatmapDate = null;
       detailDirty = true;
@@ -1300,6 +1558,50 @@ function mountShell(): void {
       state.overviewProjectFilter = target.value;
       state.selectedHeatmapDate = null;
       void refreshProfileOverview();
+      return;
+    }
+    if (target.id === "sel-default-model") {
+      state.defaultModel = target.value;
+      void handleUpdateSettings({ default_model: target.value });
+      return;
+    }
+    if (target.id === "sel-escalation-model") {
+      state.escalationModel = target.value;
+      void handleUpdateSettings({ escalation_model: target.value });
+      return;
+    }
+    if (target.id === "chk-guardrail" && "checked" in target) {
+      state.quotaGuardrailEnabled = target.checked;
+      detailDirty = true;
+      render();
+      void handleUpdateSettings({ quota_guardrail_enabled: target.checked });
+      return;
+    }
+    if (target.id === "sel-guardrail-threshold") {
+      const val = Number.parseInt(target.value, 10);
+      if (Number.isFinite(val)) {
+        state.quotaGuardrailThresholdPct = val;
+        void handleUpdateSettings({ quota_guardrail_threshold_pct: val });
+      }
+    }
+  });
+
+  document.addEventListener("click", (ev) => {
+    if (!state.settingsOpen) return;
+    const target = ev.target as HTMLElement | null;
+    if (!target) return;
+    if (!target.closest("#settings-popover") && !target.closest("#btn-settings")) {
+      state.settingsOpen = false;
+      detailDirty = true;
+      render();
+    }
+  });
+
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && state.settingsOpen) {
+      state.settingsOpen = false;
+      detailDirty = true;
+      render();
     }
   });
 }
@@ -1451,6 +1753,25 @@ async function refreshSessions(forceDetailPoll: boolean): Promise<void> {
     if (res.ui_locale && res.ui_locale !== state.uiLocale) {
       state.uiLocale = res.ui_locale;
       applyLocaleToDocument();
+      detailDirty = true;
+    }
+    if (res.default_model && res.default_model !== state.defaultModel) {
+      state.defaultModel = res.default_model;
+      detailDirty = true;
+    }
+    if (res.escalation_model && res.escalation_model !== state.escalationModel) {
+      state.escalationModel = res.escalation_model;
+      detailDirty = true;
+    }
+    if (typeof res.quota_guardrail_enabled === "boolean" && res.quota_guardrail_enabled !== state.quotaGuardrailEnabled) {
+      state.quotaGuardrailEnabled = res.quota_guardrail_enabled;
+      detailDirty = true;
+    }
+    if (
+      typeof res.quota_guardrail_threshold_pct === "number" &&
+      res.quota_guardrail_threshold_pct !== state.quotaGuardrailThresholdPct
+    ) {
+      state.quotaGuardrailThresholdPct = res.quota_guardrail_threshold_pct;
       detailDirty = true;
     }
     state.syncState = "live";
@@ -1681,7 +2002,7 @@ async function boot(): Promise<void> {
   mountShell();
   render();
 
-  const app = new App({ name: "Codex Orbit", version: "0.6.1" }, {});
+  const app = new App({ name: "Codex Orbit", version: "0.7.0" }, {});
   appInstance = app;
   api = new OrbitApi(app);
 
@@ -1751,6 +2072,7 @@ async function boot(): Promise<void> {
     await refreshProfileOverview();
   }
   void refreshQuota(false);
+  void refreshSettings();
   scheduleNextPoll();
 }
 

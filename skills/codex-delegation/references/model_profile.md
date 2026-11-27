@@ -26,13 +26,13 @@
 
 ## 2. Three Model Routing Policies (Persisted in `${PLUGIN_DATA}/settings.json`)
 
-The user can switch among 3 policies at any time either in the **Codex Orbit** panel header dropdown or via chat (`delegate_cli.py --set-routing-mode <mode>`):
+The user can configure the default/escalation models, low-quota guardrail (enabled by default at 15% 5h remaining), and switch among 3 policies at any time either in the **Codex Orbit** panel header/settings or via chat (`delegate_cli.py --set-routing-mode <mode>`):
 
 | Policy (`routing_mode`) | Display Name | Behavior |
 | :--- | :--- | :--- |
-| **`silent_low_cost`** | 节能 (Eco) | Always silently dispatches **`gpt-6.2-sol`** with conservative effort (`low`/`medium` for light/standard, `high` for complex). Never escalates to Astra and never interrupts the user for confirmation. |
-| **`ask`** *(Default)* | 均衡 (Balanced) | Silently uses **`gpt-6.2-sol`** (`medium`/`high`) for `light`/`standard` tasks. For `complex` tasks (Astra escalation candidates), **NEVER silently uses Astra** — queries live Codex quota & reset times (`--plan-route --task-tier complex`) and asks the user to choose between `gpt-6.2-astra` and `gpt-6.2-sol`. |
-| **`silent_best`** | 极致 (Max) | Silently selects the optimal model & effort without cost limits or confirmation prompts: `light` → `gpt-6.2-sol` (`medium`), `standard` backend/review → `gpt-6.2-astra` (`high`), `complex` architecture/cross-module debugging → `gpt-6.2-astra` (`xhigh`; `max`/`ultra` only if multi-cause exhaustive verification is truly needed). |
+| **`silent_low_cost`** | Eco / 节能 | Always silently dispatches the configured **`default_model`** (`gpt-6.2-sol` by default) with conservative effort (`low`/`medium` for light/standard, `high` for complex). Never escalates and never interrupts the user for confirmation. |
+| **`ask`** *(Default)* | Balanced / 均衡 | Silently uses the **`default_model`** (`medium`/`high`) for `light`/`standard` tasks. For `complex` tasks, **NEVER silently escalates** — queries live Codex quota & reset times (`--plan-route --task-tier complex`), appends a low-quota guardrail warning if 5h remaining `< threshold`, and asks the user to choose between `escalation_model` and `default_model`. |
+| **`silent_best`** | Max / 极致 | Silently selects the optimal model & effort without confirmation prompts: `light` → `default_model` (`medium`), `standard` → `escalation_model` (`high`), `complex` → `escalation_model` (`xhigh`). If the low-quota guardrail is enabled and 5h quota `< threshold`, automatically falls back to `default_model` while keeping the target reasoning effort. |
 
 ### Model Characteristics
 

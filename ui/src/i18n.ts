@@ -6,20 +6,32 @@ import type {
   UiLocale,
 } from "./types";
 
-export function resolveLocale(setting: UiLocale, hostLocale?: string | null): ResolvedLocale {
-  if (setting === "zh" || setting === "en" || setting === "ja") return setting;
-  const raw = (hostLocale || navigator.language || "en").toLowerCase();
-  if (raw.startsWith("zh")) return "zh";
+export function resolveLocale(setting: UiLocale | string, hostLocale?: string | null): ResolvedLocale {
+  if (setting === "zh-CN" || setting === "zh") return "zh-CN";
+  if (setting === "zh-TW") return "zh-TW";
+  if (setting === "en" || setting === "ja") return setting;
+  const raw = (hostLocale || navigator.language || "en").toLowerCase().replace(/_/g, "-");
+  if (raw.startsWith("zh")) {
+    if (raw.includes("tw") || raw.includes("hk") || raw.includes("mo") || raw.includes("hant")) {
+      return "zh-TW";
+    }
+    return "zh-CN";
+  }
   if (raw.startsWith("ja")) return "ja";
   return "en";
 }
 
 export function formatCompactNumber(n: number, locale: ResolvedLocale): string {
   if (!Number.isFinite(n) || n <= 0) return "0";
-  if (locale === "zh") {
+  if (locale === "zh-CN") {
     if (n >= 1e8) return `${(n / 1e8).toFixed(1)}亿`;
     if (n >= 1e4) return `${(n / 1e4).toFixed(1)}万`;
     return n.toLocaleString("zh-CN");
+  }
+  if (locale === "zh-TW") {
+    if (n >= 1e8) return `${(n / 1e8).toFixed(1)}億`;
+    if (n >= 1e4) return `${(n / 1e4).toFixed(1)}萬`;
+    return n.toLocaleString("zh-TW");
   }
   if (locale === "ja") {
     if (n >= 1e8) return `${(n / 1e8).toFixed(1)}億`;
@@ -33,13 +45,13 @@ export function formatCompactNumber(n: number, locale: ResolvedLocale): string {
 }
 
 export function formatDays(days: number, locale: ResolvedLocale): string {
-  if (locale === "zh") return `${days} 天`;
+  if (locale === "zh-CN" || locale === "zh-TW") return `${days} 天`;
   if (locale === "ja") return `${days}日`;
   return days === 1 ? "1 day" : `${days} days`;
 }
 
 export function monthLabel(monthZeroBased: number, locale: ResolvedLocale): string {
-  if (locale === "zh" || locale === "ja") return `${monthZeroBased + 1}月`;
+  if (locale === "zh-CN" || locale === "zh-TW" || locale === "ja") return `${monthZeroBased + 1}月`;
   const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   return names[monthZeroBased] ?? "";
 }
@@ -125,6 +137,25 @@ export interface Strings {
   insightActiveProjects: string;
   insightTotalCommands: string;
   insightRoutingMode: string;
+  insightModelBreakdown: string;
+  worktreesCountLabel: string;
+  settingsAria: string;
+  settingsTitle: string;
+  defaultModelLabel: string;
+  escalationModelLabel: string;
+  guardrailLabel: string;
+  guardrailThresholdLabel: string;
+  diagnosticsTitle: string;
+  runDoctorBtn: string;
+  runningDoctor: string;
+  doctorAllOk: string;
+  doctorHasWarnings: string;
+  doctorHasErrors: string;
+  pruneWorktreesBtn: string;
+  pruningWorktrees: string;
+  pruneResultToast: (removed: number, skipped: number) => string;
+  quotaLowWarning: (threshold: number) => string;
+  toastSettingsSaved: string;
   recentSessionsTitle: string;
   hotFilesTitle: string;
   touchedBySessions: (n: number) => string;
@@ -145,7 +176,7 @@ export interface Strings {
   summaryAborted: string;
 }
 
-const ZH: Strings = {
+const ZH_CN: Strings = {
   overview: "总览",
   searchPlaceholder: "搜索会话、项目或模型…",
   refreshSessions: "刷新会话列表",
@@ -227,6 +258,25 @@ const ZH: Strings = {
   insightActiveProjects: "活跃项目数",
   insightTotalCommands: "累计执行命令",
   insightRoutingMode: "当前调度策略",
+  insightModelBreakdown: "模型用量分布",
+  worktreesCountLabel: "托管 Worktree",
+  settingsAria: "设置与诊断",
+  settingsTitle: "调度设置与环境诊断",
+  defaultModelLabel: "默认主力模型",
+  escalationModelLabel: "复杂升级模型",
+  guardrailLabel: "低额度自动保护",
+  guardrailThresholdLabel: "5h 触发阈值",
+  diagnosticsTitle: "环境自检",
+  runDoctorBtn: "运行自检",
+  runningDoctor: "检测中…",
+  doctorAllOk: "环境正常",
+  doctorHasWarnings: "存在提醒项",
+  doctorHasErrors: "存在错误项",
+  pruneWorktreesBtn: "清理空闲 Worktree",
+  pruningWorktrees: "清理中…",
+  pruneResultToast: (removed, skipped) => `已清理 ${removed} 个 worktree${skipped > 0 ? `，跳过 ${skipped} 个运行中` : ""}`,
+  quotaLowWarning: (threshold) => `⚠ 5h 剩余额度低于 ${threshold}%，低额度保护已就绪。`,
+  toastSettingsSaved: "设置已保存",
   recentSessionsTitle: "最近会话",
   hotFilesTitle: "高频改动文件",
   touchedBySessions: (n) => `${n} 个会话`,
@@ -244,6 +294,126 @@ const ZH: Strings = {
   summaryMoreFiles: (n) => `… 及另外 ${n} 个文件`,
   summaryConclusion: "结论摘要",
   summaryAborted: "中止/错误",
+};
+
+const ZH_TW: Strings = {
+  overview: "總覽",
+  searchPlaceholder: "搜尋工作階段、專案或模型…",
+  refreshSessions: "重新整理工作階段列表",
+  toggleSidebar: "切換側邊欄",
+  noSessionsDir: "找不到 Codex 工作階段目錄",
+  noMatchingSessions: "無相符的工作階段",
+  noLocalSessions: "尚無本機 Codex 工作階段",
+  connecting: "連線中",
+  liveSync: "即時同步",
+  syncError: "同步異常",
+  autoFollow: "自動跟隨",
+  loadingSession: "載入中…",
+  emptySessionTurns: "此工作階段尚無執行紀錄",
+  roundsLabel: "輪次",
+  commandsLabel: "指令",
+  changedFilesLabel: "變更檔案",
+  durationLabel: "耗時",
+  thinkingSummary: (n) => `思考摘要 · ${n}`,
+  commandExecutions: "指令執行",
+  expandAllCommands: "展開全部",
+  collapseCommands: "收合",
+  liveBannerCta: "檢視進度",
+  noOutput: "(無輸出)",
+  abortedPrefix: "已中止：",
+  cancelTask: "終止任務",
+  cancelling: "終止中…",
+  attachSummary: "附加摘要",
+  attachSummaryTip: "將精簡摘要附加至下一則對話訊息",
+  sendSummary: "回傳對話",
+  sendSummaryTip: "將精簡摘要傳送至目前對話",
+  handoffRound: "回傳本輪",
+  handoffRoundTip: "將本輪精簡摘要回傳至目前對話",
+  toastCancelled: "已終止任務",
+  toastAlreadyDone: "任務已結束",
+  toastCancelFailed: (e) => `終止失敗：${e}`,
+  toastAttached: "已附加至對話",
+  toastAttachFailed: (e) => `附加失敗：${e}`,
+  toastSent: "已回傳對話",
+  toastHostRejected: "宿主拒絕回傳",
+  toastSendFailed: (e) => `回傳失敗：${e}`,
+  toastModeSwitched: (label) => `已切換：${label}`,
+  toastSwitchFailed: (e) => `切換失敗：${e}`,
+  routingPolicyAria: "模型排程策略",
+  routingPolicyTip: "Codex 模型排程策略",
+  languageAria: "介面語言",
+  languageAuto: "自動",
+  openFileTip: (p) => `在側欄開啟 ${p}`,
+  delegatedByTip: (src) => `由 ${src} 派單`,
+  roundTag: (n, delegated) => (delegated ? `第 ${n} 輪派單` : `第 ${n} 輪`),
+  roundsShort: (n) => `${n} 輪`,
+  quota5hTip: (rem, reset) => `Codex 5h 剩餘 ${rem}%（重置：${reset}）`,
+  quota7dTip: (rem, reset) => `Codex 7d 剩餘 ${rem}%（重置：${reset}）`,
+  quotaResetCreditsTip: (n) => `可用額度重置券：${n}`,
+  antigravityQuotaNote: "Antigravity 尚無公開本機額度介面，請以用戶端帳戶面板為準。",
+  allProjects: "全部專案",
+  kpiTotalTokens: "累計 Token 數",
+  kpiAgyShare: "AGY 派單佔比",
+  kpiLongestTask: "最長任務耗時",
+  kpiLongestStreak: "最長連續天數",
+  kpiCurrentStreak: "目前連續天數",
+  heatmapTitle: "活動熱力圖",
+  originAll: "全部",
+  originAgy: "AGY 派單",
+  originDirect: "自行發起",
+  metricTokens: "Token",
+  metricSessions: "工作階段數",
+  heatmapLess: "少",
+  heatmapMore: "多",
+  heatmapAgyDotHint: "含 AGY 派單",
+  heatmapTooltip: (d, tot, agy, dir, tok) =>
+    `${d} · ${tot} 次工作階段（AGY 派單 ${agy} / 自行發起 ${dir}）· ${tok} Tokens`,
+  heatmapEmptyDay: (d) => `${d} · 無活動`,
+  originSplitSummary: (agy, agyPct, dir, dirPct) =>
+    `AGY 派單 ${agy} (${agyPct}%) · 自行發起 ${dir} (${dirPct}%)`,
+  insightsTitle: "洞察",
+  insightOrigin: "工作階段來源分佈",
+  insightTopModel: "最常用的模型",
+  insightTopEffort: "最常用的推理強度",
+  insightActiveProjects: "活躍專案數",
+  insightTotalCommands: "累計執行指令",
+  insightRoutingMode: "目前排程策略",
+  insightModelBreakdown: "模型用量分佈",
+  worktreesCountLabel: "託管 Worktree",
+  settingsAria: "設定與診斷",
+  settingsTitle: "排程設定與環境診斷",
+  defaultModelLabel: "預設主力模型",
+  escalationModelLabel: "複雜升級模型",
+  guardrailLabel: "低額度自動保護",
+  guardrailThresholdLabel: "5h 觸發門檻",
+  diagnosticsTitle: "環境自檢",
+  runDoctorBtn: "執行自檢",
+  runningDoctor: "檢查中…",
+  doctorAllOk: "環境正常",
+  doctorHasWarnings: "有提醒項目",
+  doctorHasErrors: "有錯誤項目",
+  pruneWorktreesBtn: "清理閒置 Worktree",
+  pruningWorktrees: "清理中…",
+  pruneResultToast: (removed, skipped) => `已清理 ${removed} 個 worktree${skipped > 0 ? `，略過 ${skipped} 個執行中` : ""}`,
+  quotaLowWarning: (threshold) => `⚠ 5h 剩餘額度低於 ${threshold}%，低額度保護已啟用。`,
+  toastSettingsSaved: "設定已儲存",
+  recentSessionsTitle: "最近工作階段",
+  hotFilesTitle: "高頻變更檔案",
+  touchedBySessions: (n) => `${n} 個工作階段`,
+  originTagAgy: "AGY 派單",
+  originTagDirect: "自行發起",
+  clearDateFilter: "清除日期篩選",
+  noFilteredSessions: "目前篩選條件下尚無工作階段",
+  summarySessionHeading: (t) => `### Codex Orbit 工作階段摘要：${t}`,
+  summaryRoundHeading: (r) => `### Codex Orbit 摘要（第 ${r} 輪）`,
+  summaryWorkspace: "工作區",
+  summaryIsolation: "模式",
+  summaryStatus: "狀態",
+  summaryStats: (c, f, d) => `${c} 條指令，${f} 個變更檔案，耗時 ${d}`,
+  summaryFiles: "變更檔案",
+  summaryMoreFiles: (n) => `… 及另外 ${n} 個檔案`,
+  summaryConclusion: "結論摘要",
+  summaryAborted: "中止/錯誤",
 };
 
 const EN: Strings = {
@@ -328,6 +498,25 @@ const EN: Strings = {
   insightActiveProjects: "Active Projects",
   insightTotalCommands: "Commands Run",
   insightRoutingMode: "Routing Policy",
+  insightModelBreakdown: "Model Distribution",
+  worktreesCountLabel: "Managed Worktrees",
+  settingsAria: "Settings & diagnostics",
+  settingsTitle: "Routing & Diagnostics",
+  defaultModelLabel: "Default model",
+  escalationModelLabel: "Escalation model",
+  guardrailLabel: "Low-quota guardrail",
+  guardrailThresholdLabel: "5h threshold",
+  diagnosticsTitle: "Environment Check",
+  runDoctorBtn: "Run check",
+  runningDoctor: "Checking…",
+  doctorAllOk: "All checks passed",
+  doctorHasWarnings: "Warnings found",
+  doctorHasErrors: "Issues found",
+  pruneWorktreesBtn: "Prune idle worktrees",
+  pruningWorktrees: "Pruning…",
+  pruneResultToast: (removed, skipped) => `Pruned ${removed} worktree(s)${skipped > 0 ? `, skipped ${skipped} running` : ""}`,
+  quotaLowWarning: (threshold) => `⚠ 5h quota is below ${threshold}% guardrail threshold.`,
+  toastSettingsSaved: "Settings saved",
   recentSessionsTitle: "Recent Sessions",
   hotFilesTitle: "Frequently Modified Files",
   touchedBySessions: (n) => (n === 1 ? "1 session" : `${n} sessions`),
@@ -429,6 +618,25 @@ const JA: Strings = {
   insightActiveProjects: "アクティブプロジェクト",
   insightTotalCommands: "累計コマンド実行",
   insightRoutingMode: "現在のポリシー",
+  insightModelBreakdown: "モデル利用内訳",
+  worktreesCountLabel: "管理 Worktree",
+  settingsAria: "設定と診断",
+  settingsTitle: "設定と環境診断",
+  defaultModelLabel: "標準モデル",
+  escalationModelLabel: "上位モデル",
+  guardrailLabel: "低残量ガードレール",
+  guardrailThresholdLabel: "5h しきい値",
+  diagnosticsTitle: "環境診断",
+  runDoctorBtn: "診断を実行",
+  runningDoctor: "診断中…",
+  doctorAllOk: "環境は正常です",
+  doctorHasWarnings: "警告があります",
+  doctorHasErrors: "エラーがあります",
+  pruneWorktreesBtn: "待機中 Worktree を削除",
+  pruningWorktrees: "削除中…",
+  pruneResultToast: (removed, skipped) => `${removed} 件の worktree を削除${skipped > 0 ? `（実行中 ${skipped} 件をスキップ）` : ""}`,
+  quotaLowWarning: (threshold) => `⚠ 5h 残量が ${threshold}% 未満のためガードレールが有効です。`,
+  toastSettingsSaved: "設定を保存しました",
   recentSessionsTitle: "最近のセッション",
   hotFilesTitle: "よく変更されるファイル",
   touchedBySessions: (n) => `${n} 件のセッション`,
@@ -449,13 +657,14 @@ const JA: Strings = {
 };
 
 export function getStrings(locale: ResolvedLocale): Strings {
-  if (locale === "zh") return ZH;
+  if (locale === "zh-CN") return ZH_CN;
+  if (locale === "zh-TW") return ZH_TW;
   if (locale === "ja") return JA;
   return EN;
 }
 
 export function statusLabel(status: SessionStatus, locale: ResolvedLocale): string {
-  if (locale === "zh") {
+  if (locale === "zh-CN") {
     switch (status) {
       case "running":
         return "运行中";
@@ -465,6 +674,18 @@ export function statusLabel(status: SessionStatus, locale: ResolvedLocale): stri
         return "已中止";
       default:
         return "空闲";
+    }
+  }
+  if (locale === "zh-TW") {
+    switch (status) {
+      case "running":
+        return "執行中";
+      case "completed":
+        return "已完成";
+      case "aborted":
+        return "已中止";
+      default:
+        return "閒置";
     }
   }
   if (locale === "ja") {
@@ -493,7 +714,7 @@ export function statusLabel(status: SessionStatus, locale: ResolvedLocale): stri
 
 export function isolationLabel(mode: IsolationMode | null | undefined, locale: ResolvedLocale): string {
   if (!mode) return "";
-  if (locale === "zh") {
+  if (locale === "zh-CN") {
     switch (mode) {
       case "read-only":
         return "只读";
@@ -501,6 +722,16 @@ export function isolationLabel(mode: IsolationMode | null | undefined, locale: R
         return "Worktree";
       case "workspace-write":
         return "同目录";
+    }
+  }
+  if (locale === "zh-TW") {
+    switch (mode) {
+      case "read-only":
+        return "唯讀";
+      case "worktree":
+        return "Worktree";
+      case "workspace-write":
+        return "同目錄";
     }
   }
   if (locale === "ja") {
@@ -524,7 +755,7 @@ export function isolationLabel(mode: IsolationMode | null | undefined, locale: R
 }
 
 export function routingModeLabel(mode: RoutingMode, locale: ResolvedLocale): string {
-  if (locale === "zh") {
+  if (locale === "zh-CN") {
     switch (mode) {
       case "silent_low_cost":
         return "节能";
@@ -532,6 +763,16 @@ export function routingModeLabel(mode: RoutingMode, locale: ResolvedLocale): str
         return "均衡";
       case "silent_best":
         return "极致";
+    }
+  }
+  if (locale === "zh-TW") {
+    switch (mode) {
+      case "silent_low_cost":
+        return "節能";
+      case "ask":
+        return "均衡";
+      case "silent_best":
+        return "極致";
     }
   }
   if (locale === "ja") {
@@ -557,6 +798,17 @@ export function routingModeLabel(mode: RoutingMode, locale: ResolvedLocale): str
 export function effortLabel(effort: string | null | undefined, locale: ResolvedLocale): string {
   if (!effort) return "-";
   if (locale === "en") return effort;
+  if (locale === "zh-TW") {
+    const twMap: Record<string, string> = {
+      low: "低 (low)",
+      medium: "中 (medium)",
+      high: "高 (high)",
+      xhigh: "極高 (xhigh)",
+      max: "最大 (max)",
+      ultra: "Ultra",
+    };
+    return twMap[effort.toLowerCase()] ?? effort;
+  }
   if (locale === "ja") {
     const jaMap: Record<string, string> = {
       low: "低 (low)",
@@ -585,7 +837,8 @@ export function formatRelativeTime(iso: string | null | undefined, locale: Resol
   if (Number.isNaN(ts)) return "";
   const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
   if (diffSec < 60) {
-    if (locale === "zh") return "刚刚";
+    if (locale === "zh-CN") return "刚刚";
+    if (locale === "zh-TW") return "剛剛";
     if (locale === "ja") return "たった今";
     return "just now";
   }
