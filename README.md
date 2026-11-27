@@ -12,9 +12,9 @@ Google Antigravity 2.0 native MCP App plugin for zero-token live monitoring of l
 - **Model-Aware Delegation (`codex-delegation` skill + static `references/model_profile.md` + `server/delegate_cli.py`)**:
   - Encodes the current pairing workflow: **Gemini handles frontend/UI & orchestration; Codex (`gpt-6.2-sol` by default) handles backend/systems/tests/reviews** using the 5-part GPT-6.2 colleague brief.
   - **Three switchable model routing policies** (persisted in `${PLUGIN_DATA}/settings.json`, switchable from the Codex Orbit topbar or CLI `--set-routing-mode`):
-    - **静默低成本模式 (`silent_low_cost`)**: Always silently uses `gpt-6.2-sol` (`low`/`medium`/`high`).
-    - **问询模式 (`ask`, default)**: Uses `gpt-6.2-sol` silently for routine work; on complex Astra-worthy tasks, queries live Codex quota (`--plan-route --task-tier complex`) and asks the user before escalating to `gpt-6.2-astra`.
-    - **静默最佳分配模式 (`silent_best`)**: Silently assigns the optimal model & effort (`gpt-6.2-astra` `high`/`xhigh` for standard/complex backend tasks) without cost gating.
+    - **节能 / Eco (`silent_low_cost`)**: Always silently uses `gpt-6.2-sol` (`low`/`medium`/`high`).
+    - **均衡 / Balanced (`ask`, default)**: Uses `gpt-6.2-sol` silently for routine work; on complex Astra-worthy tasks, queries live Codex quota (`--plan-route --task-tier complex`) and asks the user before escalating to `gpt-6.2-astra`.
+    - **极致 / Max (`silent_best`)**: Silently assigns the optimal model & effort (`gpt-6.2-astra` `high`/`xhigh` for standard/complex backend tasks) without cost gating.
   - **Same-workspace serial handoff, live web research & Codex Desktop sync**: Defaults to sharing the Antigravity workspace (`workspace-write`, `read-only` for review, `worktree` when editing in parallel, optional `--web-search` for live online research + Markdown report handoff in Git or non-Git workspaces), prefixes thread names with `agy: ` via official `thread/name/set`, and binds/creates the matching Codex Desktop project with backup & graceful degradation.
   - Returns only a compact JSON summary on completion without flooding model context with raw command stdout.
 - **Live Controls & Conversation Handoff**:

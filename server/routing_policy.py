@@ -25,9 +25,9 @@ MODEL_SOL = "gpt-6.2-sol"
 MODEL_ASTRA = "gpt-6.2-astra"
 
 ROUTING_MODE_LABELS: dict[RoutingMode, str] = {
-    "silent_low_cost": "静默低成本模式",
-    "ask": "问询模式",
-    "silent_best": "静默最佳分配模式",
+    "silent_low_cost": "节能",
+    "ask": "均衡",
+    "silent_best": "极致",
 }
 
 
@@ -157,7 +157,7 @@ def resolve_route(
                 model=MODEL_SOL,
                 reasoning_effort="low" if is_read_only else "medium",
                 requires_confirmation=False,
-                reason="静默低成本模式：轻量任务直接使用 gpt-6.2-sol 低消耗档位。",
+                reason="节能模式：轻量任务直接使用 gpt-6.2-sol 低消耗档位。",
             )
         if task_tier == "standard":
             return RouteDecision(
@@ -166,7 +166,7 @@ def resolve_route(
                 model=MODEL_SOL,
                 reasoning_effort="medium",
                 requires_confirmation=False,
-                reason="静默低成本模式：常规后端任务使用 gpt-6.2-sol (medium)。",
+                reason="节能模式：常规后端任务使用 gpt-6.2-sol (medium)。",
             )
         return RouteDecision(
             routing_mode=routing_mode,
@@ -174,7 +174,7 @@ def resolve_route(
             model=MODEL_SOL,
             reasoning_effort="high",
             requires_confirmation=False,
-            reason="静默低成本模式：复杂任务保持 gpt-6.2-sol (high)，不升级 Astra。",
+            reason="节能模式：复杂任务保持 gpt-6.2-sol (high)，不升级 Astra。",
         )
 
     if routing_mode == "silent_best":
@@ -185,7 +185,7 @@ def resolve_route(
                 model=MODEL_SOL,
                 reasoning_effort="medium",
                 requires_confirmation=False,
-                reason="静默最佳分配模式：轻量查询/单测用 gpt-6.2-sol (medium) 保证速度与精准度。",
+                reason="极致模式：轻量查询/单测用 gpt-6.2-sol (medium) 保证速度与精准度。",
             )
         if task_tier == "standard":
             return RouteDecision(
@@ -194,7 +194,7 @@ def resolve_route(
                 model=MODEL_ASTRA,
                 reasoning_effort="high",
                 requires_confirmation=False,
-                reason="静默最佳分配模式：常规后端开发/深度审查直接使用 gpt-6.2-astra (high)。",
+                reason="极致模式：常规后端开发/深度审查直接使用 gpt-6.2-astra (high)。",
             )
         return RouteDecision(
             routing_mode=routing_mode,
@@ -202,10 +202,10 @@ def resolve_route(
             model=MODEL_ASTRA,
             reasoning_effort="xhigh",
             requires_confirmation=False,
-            reason="静默最佳分配模式：复杂架构/跨模块疑难排查直接使用 gpt-6.2-astra (xhigh)。",
+            reason="极致模式：复杂架构/跨模块疑难排查直接使用 gpt-6.2-astra (xhigh)。",
         )
 
-    # Default: "ask" (问询模式)
+    # Default: "ask" (均衡模式)
     if task_tier == "light":
         return RouteDecision(
             routing_mode=routing_mode,
@@ -213,7 +213,7 @@ def resolve_route(
             model=MODEL_SOL,
             reasoning_effort="medium",
             requires_confirmation=False,
-            reason="问询模式：轻量任务静默使用 gpt-6.2-sol (medium)。",
+            reason="均衡模式：轻量任务静默使用 gpt-6.2-sol (medium)。",
         )
     if task_tier == "standard":
         return RouteDecision(
@@ -222,7 +222,7 @@ def resolve_route(
             model=MODEL_SOL,
             reasoning_effort="medium" if is_read_only else "high",
             requires_confirmation=False,
-            reason="问询模式：常规任务静默使用 gpt-6.2-sol。",
+            reason="均衡模式：常规任务静默使用 gpt-6.2-sol。",
         )
     return RouteDecision(
         routing_mode=routing_mode,
@@ -234,5 +234,5 @@ def resolve_route(
         recommended_effort="high" if is_read_only else "xhigh",
         fallback_model=MODEL_SOL,
         fallback_effort="xhigh",
-        reason="问询模式：任务属于复杂架构/跨模块疑难排查，建议升级 gpt-6.2-astra，需结合当前剩余额度由用户拍板。",
+        reason="均衡模式：任务属于复杂架构/跨模块疑难排查，建议升级 gpt-6.2-astra，需结合当前剩余额度由用户拍板。",
     )

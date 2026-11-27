@@ -30,9 +30,9 @@ The user can switch among 3 policies at any time either in the **Codex Orbit** p
 
 | Policy (`routing_mode`) | Display Name | Behavior |
 | :--- | :--- | :--- |
-| **`silent_low_cost`** | 静默低成本模式 | Always silently dispatches **`gpt-6.2-sol`** with conservative effort (`low`/`medium` for light/standard, `high` for complex). Never escalates to Astra and never interrupts the user for confirmation. |
-| **`ask`** *(Default)* | 问询模式 | Silently uses **`gpt-6.2-sol`** (`medium`/`high`) for `light`/`standard` tasks. For `complex` tasks (Astra escalation candidates), **NEVER silently uses Astra** — queries live Codex quota & reset times (`--plan-route --task-tier complex`) and asks the user to choose between `gpt-6.2-astra` and `gpt-6.2-sol`. |
-| **`silent_best`** | 静默最佳分配模式 | Silently selects the optimal model & effort without cost limits or confirmation prompts: `light` → `gpt-6.2-sol` (`medium`), `standard` backend/review → `gpt-6.2-astra` (`high`), `complex` architecture/cross-module debugging → `gpt-6.2-astra` (`xhigh`; `max`/`ultra` only if multi-cause exhaustive verification is truly needed). |
+| **`silent_low_cost`** | 节能 (Eco) | Always silently dispatches **`gpt-6.2-sol`** with conservative effort (`low`/`medium` for light/standard, `high` for complex). Never escalates to Astra and never interrupts the user for confirmation. |
+| **`ask`** *(Default)* | 均衡 (Balanced) | Silently uses **`gpt-6.2-sol`** (`medium`/`high`) for `light`/`standard` tasks. For `complex` tasks (Astra escalation candidates), **NEVER silently uses Astra** — queries live Codex quota & reset times (`--plan-route --task-tier complex`) and asks the user to choose between `gpt-6.2-astra` and `gpt-6.2-sol`. |
+| **`silent_best`** | 极致 (Max) | Silently selects the optimal model & effort without cost limits or confirmation prompts: `light` → `gpt-6.2-sol` (`medium`), `standard` backend/review → `gpt-6.2-astra` (`high`), `complex` architecture/cross-module debugging → `gpt-6.2-astra` (`xhigh`; `max`/`ultra` only if multi-cause exhaustive verification is truly needed). |
 
 ### Model Characteristics
 

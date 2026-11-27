@@ -395,20 +395,20 @@ export function routingModeLabel(mode: RoutingMode, locale: ResolvedLocale): str
   if (locale === "zh") {
     switch (mode) {
       case "silent_low_cost":
-        return "静默低成本";
+        return "节能";
       case "ask":
-        return "问询模式";
+        return "均衡";
       case "silent_best":
-        return "静默最佳";
+        return "极致";
     }
   }
   switch (mode) {
     case "silent_low_cost":
-      return "Silent · Low Cost";
+      return "Eco";
     case "ask":
-      return "Ask · Balanced";
+      return "Balanced";
     case "silent_best":
-      return "Silent · Best";
+      return "Max";
   }
 }
 

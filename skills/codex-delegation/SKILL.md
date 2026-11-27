@@ -22,11 +22,11 @@ Always read [references/model_profile.md](references/model_profile.md) before dr
      & $rt.python_bin -u $rt.delegate_cli --plan-route --task-tier complex --mode workspace-write
      ```
    - Follow the returned policy strictly:
-     - **`silent_low_cost`（静默低成本模式）**: Dispatch silently with `gpt-6.2-sol` and the returned effort; never escalate to Astra.
-     - **`ask`（问询模式 — 默认）**: If `requires_confirmation` is `false`, dispatch silently with the returned `model` & `reasoning_effort`. If `requires_confirmation` is `true` (`complex` tier), **DO NOT dispatch yet** — present the recommended `gpt-6.2-astra` vs `gpt-6.2-sol` option together with the returned **Codex 5h & 7d remaining quota + reset times** (and Antigravity quota note), and let the user decide.
-     - **`silent_best`（静默最佳分配模式）**: Dispatch silently with the returned best `model` (`gpt-6.2-astra` for `standard`/`complex`) & `reasoning_effort` without asking.
+     - **`silent_low_cost`（节能模式 / Eco）**: Dispatch silently with `gpt-6.2-sol` and the returned effort; never escalate to Astra.
+     - **`ask`（均衡模式 / Balanced — 默认）**: If `requires_confirmation` is `false`, dispatch silently with the returned `model` & `reasoning_effort`. If `requires_confirmation` is `true` (`complex` tier), **DO NOT dispatch yet** — present the recommended `gpt-6.2-astra` vs `gpt-6.2-sol` option together with the returned **Codex 5h & 7d remaining quota + reset times** (and Antigravity quota note), and let the user decide.
+     - **`silent_best`（极致模式 / Max）**: Dispatch silently with the returned best `model` (`gpt-6.2-astra` for `standard`/`complex`) & `reasoning_effort` without asking.
 3. **Switching Policies via Chat**:
-   - When the user asks to change the routing policy (e.g., "切到静默低成本模式" / "切到问询模式" / "切到静默最佳模式"), persist it immediately so both future turns and the **Codex Orbit** UI stay synchronized:
+   - When the user asks to change the routing policy (e.g., "切到节能模式" / "切到均衡模式" / "切到极致模式"), persist it immediately so both future turns and the **Codex Orbit** UI stay synchronized:
      ```powershell
      $rt = Get-Content "$env:LOCALAPPDATA\agy-codex-orbit\runtime.json" -Raw | ConvertFrom-Json
      & $rt.python_bin -u $rt.delegate_cli --set-routing-mode silent_best

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -27,30 +27,37 @@ def test_ui_locale_persistence(tmp_path: Path) -> None:
 
 
 def test_profile_overview_splits_agy_vs_direct_and_computes_streaks(tmp_path: Path) -> None:
-    day_dir = tmp_path / "sessions" / "2026" / "11" / "26"
+    now_local = datetime.now().astimezone()
+    today_local = now_local.date()
+    yesterday_local = today_local - timedelta(days=1)
+    tz = now_local.tzinfo
+    t1_ts = datetime(today_local.year, today_local.month, today_local.day, 10, 0, tzinfo=tz).isoformat()
+    t2_ts = datetime(yesterday_local.year, yesterday_local.month, yesterday_local.day, 10, 5, tzinfo=tz).isoformat()
+
+    day_dir = tmp_path / "sessions" / f"{today_local.year:04d}" / f"{today_local.month:02d}" / f"{today_local.day:02d}"
     day_dir.mkdir(parents=True)
 
     s1 = "11111111-0000-0000-0000-000000000001"
     s2 = "22222222-0000-0000-0000-000000000002"
 
-    # Session 1: AGY-delegated session on 2026-11-26 (also tests AGENTS.md boilerplate filtering)
-    r1 = day_dir / f"rollout-2026-11-26T10-00-00-{s1}.jsonl"
+    # Session 1: AGY-delegated session today (also tests AGENTS.md boilerplate filtering)
+    r1 = day_dir / f"rollout-{today_local.isoformat()}T10-00-00-{s1}.jsonl"
     r1.write_text(
         "\n".join(
             json.dumps(x)
             for x in [
                 {
-                    "timestamp": "2026-11-26T10:00:00Z",
+                    "timestamp": t1_ts,
                     "type": "session_meta",
                     "payload": {"session_id": s1, "cwd": "D:\\work\\orbit-demo"},
                 },
                 {
-                    "timestamp": "2026-11-26T10:00:01Z",
+                    "timestamp": t1_ts,
                     "type": "turn_context",
                     "payload": {"turn_id": "t1", "model": "gpt-6.2-sol", "effort": "high"},
                 },
                 {
-                    "timestamp": "2026-11-26T10:00:01Z",
+                    "timestamp": t1_ts,
                     "type": "response_item",
                     "payload": {
                         "type": "message",
@@ -60,7 +67,7 @@ def test_profile_overview_splits_agy_vs_direct_and_computes_streaks(tmp_path: Pa
                     },
                 },
                 {
-                    "timestamp": "2026-11-26T10:00:02Z",
+                    "timestamp": t1_ts,
                     "type": "event_msg",
                     "payload": {
                         "type": "token_count",
@@ -68,7 +75,7 @@ def test_profile_overview_splits_agy_vs_direct_and_computes_streaks(tmp_path: Pa
                     },
                 },
                 {
-                    "timestamp": "2026-11-26T10:00:05Z",
+                    "timestamp": t1_ts,
                     "type": "event_msg",
                     "payload": {"type": "task_complete", "turn_id": "t1", "duration_ms": 5000},
                 },
@@ -78,24 +85,24 @@ def test_profile_overview_splits_agy_vs_direct_and_computes_streaks(tmp_path: Pa
         encoding="utf-8",
     )
 
-    # Session 2: Direct Codex session on 2026-11-25 (creates a 2-day streak!)
-    r2 = day_dir / f"rollout-2026-11-25T10-05-00-{s2}.jsonl"
+    # Session 2: Direct Codex session yesterday (creates a 2-day streak!)
+    r2 = day_dir / f"rollout-{yesterday_local.isoformat()}T10-05-00-{s2}.jsonl"
     r2.write_text(
         "\n".join(
             json.dumps(x)
             for x in [
                 {
-                    "timestamp": "2026-11-25T10:05:00Z",
+                    "timestamp": t2_ts,
                     "type": "session_meta",
                     "payload": {"session_id": s2, "cwd": "D:\\work\\orbit-demo"},
                 },
                 {
-                    "timestamp": "2026-11-25T10:05:01Z",
+                    "timestamp": t2_ts,
                     "type": "turn_context",
                     "payload": {"turn_id": "t1", "model": "gpt-6.2-astra", "effort": "medium"},
                 },
                 {
-                    "timestamp": "2026-11-25T10:05:02Z",
+                    "timestamp": t2_ts,
                     "type": "event_msg",
                     "payload": {
                         "type": "token_count",
@@ -103,7 +110,7 @@ def test_profile_overview_splits_agy_vs_direct_and_computes_streaks(tmp_path: Pa
                     },
                 },
                 {
-                    "timestamp": "2026-11-25T10:05:10Z",
+                    "timestamp": t2_ts,
                     "type": "event_msg",
                     "payload": {"type": "task_complete", "turn_id": "t1", "duration_ms": 9000},
                 },
@@ -132,7 +139,7 @@ def test_profile_overview_splits_agy_vs_direct_and_computes_streaks(tmp_path: Pa
     assert detail1 is not None
     assert detail1.turns[0].prompt == "Build backend endpoint"  # AGENTS.md filtered, delegation prompt kept!
 
-    ov = build_profile_overview(store, data_dir=data_dir, today_override=date(2026, 11, 26))
+    ov = build_profile_overview(store, data_dir=data_dir, today_override=today_local)
     k = ov["kpis"]
     assert k["total_sessions"] == 2
     assert k["agy_sessions"] == 1
