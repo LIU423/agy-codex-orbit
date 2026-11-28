@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from server.rollout_parser import RolloutParseState
+from server.rollout_parser import RolloutParseState, _normalize_project_dir
 from server.session_store import SessionStore
 
 FIXTURE_PATH = (
@@ -17,6 +17,24 @@ FIXTURE_PATH = (
     / "fixtures"
     / "rollout-2026-11-26T10-00-00-11111111-2222-3333-4444-555555555555.jsonl"
 )
+
+
+@pytest.mark.parametrize(
+    ("cwd", "project_dir", "name"),
+    [
+        (r"D:\work\sample-app" + "\\", r"D:\work\sample-app", "sample-app"),
+        ("D:/work/sample-app/", "D:/work/sample-app", "sample-app"),
+        (r"\\host\share\sample-app", r"\\host\share\sample-app", "sample-app"),
+        ("D:\\", "D:\\", "D:\\"),
+        ("/srv/sample-app/", "/srv/sample-app", "sample-app"),
+        (r"/srv/project\name", r"/srv/project\name", r"project\name"),
+        ("/", "/", "/"),
+    ],
+)
+def test_normalize_project_dir_uses_the_logged_path_flavor(
+    cwd: str, project_dir: str, name: str
+) -> None:
+    assert _normalize_project_dir(cwd) == (project_dir, name)
 
 
 def test_parse_structured_rollout_fixture() -> None:

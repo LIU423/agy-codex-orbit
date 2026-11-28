@@ -2,14 +2,27 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from server.delegate_cli import parse_args, run_delegation
 from server.delegation_store import DelegationStore, is_process_alive
 from server.process_control import cancel_delegation
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Uses Linux procfs")
+def test_is_process_alive_ignores_an_unreaped_child() -> None:
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+        assert not is_process_alive(child.pid)
+    finally:
+        child.wait(timeout=5)
 
 
 def test_cancel_delegation_terminates_process_tree_and_is_idempotent(tmp_path: Path) -> None:

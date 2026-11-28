@@ -86,14 +86,25 @@ def is_process_alive(pid: int | None) -> bool:
             return exit_code.value == STILL_ACTIVE
         finally:
             kernel32.CloseHandle(handle)
-    else:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+
+    if sys.platform.startswith("linux"):
+        # A zombie still has a PID, but it cannot run or be killed again.
+        # Split after the closing parenthesis because comm can contain spaces and ')'.
         try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
+            stat = Path(f"/proc/{pid}/stat").read_bytes()
+        except OSError:
+            pass  # Keep the signal probe result if procfs is unavailable.
+        else:
+            state = stat.rpartition(b")")[2].split(maxsplit=1)
+            if state and state[0] in (b"Z", b"X"):
+                return False
+    return True
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:

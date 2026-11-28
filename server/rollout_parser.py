@@ -11,7 +11,8 @@ Supports:
 from __future__ import annotations
 
 import json
-import os
+import ntpath
+import posixpath
 import re
 import time
 from dataclasses import dataclass, field
@@ -101,11 +102,17 @@ def _normalize_project_dir(cwd: str | None) -> tuple[str, str]:
     if not cwd or not cwd.strip():
         return "(Unknown Workspace)", "Unknown Workspace"
     cleaned = cwd.strip()
-    _, tail = os.path.splitdrive(cleaned)
-    if not tail.strip("\\/"):
+    # Rollouts may come from a different OS than the dashboard.
+    is_windows = bool(ntpath.splitdrive(cleaned)[0]) or (
+        not cleaned.startswith("/") and "\\" in cleaned
+    )
+    path_module = ntpath if is_windows else posixpath
+    separators = "\\/" if is_windows else "/"
+    _, tail = path_module.splitdrive(cleaned)
+    if not tail.strip(separators):
         return cleaned, cleaned
-    cleaned = cleaned.rstrip("\\/")
-    name = os.path.basename(cleaned) or cleaned
+    cleaned = cleaned.rstrip(separators)
+    name = path_module.basename(cleaned) or cleaned
     return cleaned, name
 
 
